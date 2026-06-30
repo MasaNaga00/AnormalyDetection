@@ -37,6 +37,7 @@ import numpy as np
 import pandas as pd
 
 import cusum_monitor as cm  # 検知エンジン（ドリフト/スパイク）を委譲
+import earlylife_baseline as el  # 安定化前カーブ lambda0(t)（フェーズ2で結線）
 
 
 # ============================================================================
@@ -55,6 +56,7 @@ CONFIG: dict = {
         "biz": "事業コード", "dev": "開発コード", "part": "部番", "dist": "販社",
         "ym": "年月", "elapsed": "経過月",
         "monthly_use": "月次使用数", "cum_sales": "累積販売台数",
+        "sf": "SF-コード", "rank": "ランク",   # 安定化前モードの集団キー（任意。無ければ暫定動作）
     },
     # --- 検知パラメータ（cusum_monitor へ渡す。台帳の感度上書きで単位ごとに上書き可）---
     "R": 2.0,
@@ -70,6 +72,15 @@ CONFIG: dict = {
     "monitor_end_m": 60,      # 妥当性ウィンドウ上限（経過月）。末期は監視対象外
     "lambda0_floor": 1e-6,
     "min_leaders": 3,
+    # --- 安定化前カーブ（earlylife_baseline へ渡す。フェーズ2）---
+    # 集団の階層フォールバック（細→粗）。各階層のキー列が揃っていて、かつ先行機種が
+    # min_leaders 以上ある最初の階層を使う。どれも満たさなければ監視保留。
+    # ランクが一部の機種にしか無くても、ランクのある集団だけランク単位、無ければSF単位に自動で落ちる。
+    "earlylife_group_levels": [["biz", "sf", "rank"], ["biz", "sf"]],
+    "earlylife_group_keys": ["biz", "sf"],   # 後方互換: group_levels=None のとき単一階層として使用
+    "earlylife_smooth_window": 3,            # 経過月方向の平滑化窓（奇数）
+    "earlylife_rate_floor_frac": 0.1,        # ゼロ下限（カーブ中央値×この割合）
+    "earlylife_prior_strength_floor": 1.0,   # Gamma事前の最小強度
     # --- 前処理 / 判定 ---
     "fill_zero_months": True,
     "asof_ym": None,
@@ -125,11 +136,16 @@ def _add_months(ym: int, n: int) -> int:
 # ============================================================================
 def _prepare_panel(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     c = cfg["cols"]
-    df = df.rename(columns={
+    rename = {
         c["biz"]: "biz", c["dev"]: "dev", c["part"]: "part", c["dist"]: "dist",
         c["ym"]: "ym", c["elapsed"]: "elapsed",
         c["monthly_use"]: "use", c["cum_sales"]: "fleet",
-    }).copy()
+    }
+    for k in ("sf", "rank"):  # 集団キーは任意。あればマッピング
+        col = c.get(k)
+        if col and col in df.columns:
+            rename[col] = k
+    df = df.rename(columns=rename).copy()
     df["ym"] = df["ym"].map(to_yyyymm).astype("int64")
     for col in ("use", "fleet", "elapsed"):
         df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -153,6 +169,9 @@ def _fill_zero_months(df: pd.DataFrame) -> pd.DataFrame:
         g2["use"] = g2["use"].fillna(0.0)
         g2["fleet"] = g2["fleet"].ffill()
         g2["elapsed"] = g2["elapsed"].ffill()
+        for col in ("sf", "rank"):  # 静的属性は前後埋め
+            if col in g2.columns:
+                g2[col] = g2[col].ffill().bfill()
         for i, k in enumerate(keys):
             g2[k] = key[i] if isinstance(key, tuple) else key
         out.append(g2.reset_index().rename(columns={"index": "ym"}))
@@ -160,8 +179,11 @@ def _fill_zero_months(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def aggregate_units(panel: pd.DataFrame) -> pd.DataFrame:
-    g = (panel.groupby(["biz", "dev", "part", "ym"], as_index=False)
-               .agg(use=("use", "sum"), fleet=("fleet", "sum"), elapsed=("elapsed", "max")))
+    agg = {"use": ("use", "sum"), "fleet": ("fleet", "sum"), "elapsed": ("elapsed", "max")}
+    for col in ("sf", "rank"):  # 機種×部番に一意な静的属性は first で持ち上げ
+        if col in panel.columns:
+            agg[col] = (col, "first")
+    g = panel.groupby(["biz", "dev", "part", "ym"], as_index=False).agg(**agg)
     return g.sort_values(["biz", "dev", "part", "ym"]).reset_index(drop=True)
 
 
@@ -206,11 +228,81 @@ def classify_mode(unit: pd.DataFrame, cfg: dict) -> str:
     return "安定化前"
 
 
-def earlylife_lambda0(unit: pd.DataFrame, pooled_lambda0: float, cfg: dict) -> float:
-    """安定化前モードの暫定ベースライン（フェーズ2で earlylife_baseline へ結線）。
-    本来は earlylife_baseline.estimate_earlylife_curve + attach_curve_to_unit で
-    配列 lambda0(t) を返す。本版はプール平均にフォールバックし「安定化前(暫定)」と明示する。"""
-    return max(float(pooled_lambda0), cfg["lambda0_floor"])
+def _earlylife_levels(cfg: dict) -> list[list[str]]:
+    lv = cfg.get("earlylife_group_levels")
+    if lv:
+        return lv
+    gk = cfg.get("earlylife_group_keys")
+    return [gk] if gk else []
+
+
+def build_earlylife_curves(units_df: pd.DataFrame, cfg: dict) -> list[dict]:
+    """安定期単位（=先行機種群）から、集団の各階層ごとに期待カーブ lambda0(t) を推定する。
+
+    階層は cfg['earlylife_group_levels']（細→粗、例 [["biz","sf","rank"],["biz","sf"]]）。
+    各階層は、その階層のキー列が全て存在し、値が欠損しない先行機種だけで作る。
+    ランクが一部の機種にしか無くても、ランク階層はランクのある機種で作られ、SF階層は全機種で作られる。
+
+    安定化前の監視対象は定義上 leaders に入らないので、スケールは先行機種側で固定される。
+
+    Returns: 階層ごとの dict(keys, curve, counts) のリスト（細→粗の順）。
+             counts は (group_tuple -> 先行機種数(固有dev))。集団キー列が無ければ空リスト。
+    """
+    levels = _earlylife_levels(cfg)
+    if not levels:
+        return []
+    leaders = [u for _, u in units_df.groupby(["biz", "dev", "part"], sort=False)
+               if classify_mode(u, cfg) == "安定期"]
+    if not leaders:
+        return []
+    leaders_df = pd.concat(leaders, ignore_index=True)
+
+    out = []
+    for keys in levels:
+        if any(k not in units_df.columns for k in keys):
+            continue  # この階層のキー列が無い → 粗い階層へ
+        ld = leaders_df.dropna(subset=keys)
+        if ld.empty:
+            continue
+        lc = ld.groupby(keys)["dev"].nunique()
+        counts = {(k if isinstance(k, tuple) else (k,)): int(v) for k, v in lc.items()}
+        curve = el.estimate_earlylife_curve(
+            ld, group_keys=keys, max_keizoku=int(cfg["monitor_end_m"]),
+            col_keizoku="elapsed", col_usage="use", col_fleet="fleet", col_model="dev",
+            prior_strength_floor=cfg["earlylife_prior_strength_floor"],
+            smooth_window=cfg["earlylife_smooth_window"],
+            rate_floor_frac=cfg["earlylife_rate_floor_frac"],
+        )
+        if curve is None or curve.empty:
+            continue
+        out.append(dict(keys=keys, curve=curve, counts=counts))
+    return out
+
+
+def earlylife_lambda0(unit: pd.DataFrame, levels: list[dict],
+                      pooled_lambda0: float, cfg: dict):
+    """安定化前モードの基準レートを、階層フォールバックで決める。
+    Returns (lambda0, mode_label, level_label, leader_count):
+      - 集団キー列が無い               → (スカラ pooled, "安定化前(暫定)", None, None)
+      - 細→粗で、キーが揃い先行機種≥min_leaders の最初の階層を採用 → (カーブ配列, "安定化前", "biz+sf[+rank]", n)
+      - どの階層も満たさない           → (全0配列, "安定化前(保留)", None, None)  ※監視不能＝鳴らさない
+    unit は ym 昇順・連番indexで渡すこと（返り配列が unit の各行に対応する）。"""
+    if not levels:
+        return max(float(pooled_lambda0), cfg["lambda0_floor"]), "安定化前(暫定)", None, None
+    for lv in levels:                      # 細 → 粗
+        keys = lv["keys"]
+        vals = [unit[k].iloc[0] for k in keys]
+        if any(pd.isna(v) for v in vals):  # この単位はこの階層のキーが欠損 → 粗い階層へ
+            continue
+        gval = tuple(vals)
+        cnt = lv["counts"].get(gval, 0)
+        if cnt < cfg["min_leaders"]:       # 先行機種が足りない → 粗い階層へ
+            continue
+        lam = np.asarray(
+            el.attach_curve_to_unit(unit, lv["curve"], keys, col_keizoku="elapsed"), dtype=float)
+        if lam.size and not np.all(lam <= 0):
+            return lam, "安定化前", "+".join(keys), cnt
+    return np.zeros(len(unit)), "安定化前(保留)", None, None
 
 
 # ============================================================================
@@ -417,15 +509,18 @@ def resolve_state(events: list[dict], rep: pd.DataFrame, ym: int,
 def evaluate_units(units_df: pd.DataFrame, ledger: pd.DataFrame, cfg: dict, asof: int):
     machine_end = machine_end_at(ledger, cfg)
     pooled = _pooled_lambda0(units_df, cfg)
+    levels = build_earlylife_curves(units_df, cfg)
     all_rows, meta = [], {}
     for (biz, dev, part), unit in units_df.groupby(["biz", "dev", "part"], sort=False):
+        unit = unit.sort_values("ym").reset_index(drop=True)  # カーブ配列と行を対応させる
         mode = classify_mode(unit, cfg)
+        level_label, leader_cnt = None, None
         if mode == "安定期":
             base = estimate_baseline(unit, cfg)          # (lambda0, C, E)
             mode_label = "安定期"
         else:
-            base = (earlylife_lambda0(unit, pooled, cfg), None, None)
-            mode_label = "安定化前(暫定)"
+            lam0, mode_label, level_label, leader_cnt = earlylife_lambda0(unit, levels, pooled, cfg)
+            base = (lam0, None, None)
         events = unit_events(ledger, biz, dev, part, asof)
         plan = build_plan(events, unit, base, cfg)
         rep = replay_unit(unit, base, mode_label, plan, cfg)
@@ -441,12 +536,14 @@ def evaluate_units(units_df: pd.DataFrame, ledger: pd.DataFrame, cfg: dict, asof
         all_rows.append(rep)
 
         meta[(biz, dev, part)] = dict(
-            mode=mode_label, base_lambda0=base[0],
+            mode=mode_label,
+            base_lambda0=(float(np.mean(base[0])) if isinstance(base[0], np.ndarray) else base[0]),
             baseline_origin=(plan.baseline_from[-1][0] if plan.baseline_from
                              else int(rep["ym"].min())),
             reset_count=len(plan.reset_after),
             last_reset=max(plan.reset_after) if plan.reset_after else None,
             machine_end=machine_end.get((biz, dev)), close_month=plan.close_month,
+            earlylife_level=level_label, leader_count=leader_cnt,
             events=events, plan=plan, base=base,
         )
     table = pd.concat(all_rows, ignore_index=True) if all_rows else pd.DataFrame()
@@ -559,6 +656,8 @@ def build_tableau(table: pd.DataFrame, meta: dict, cfg: dict) -> pd.DataFrame:
     t["現ベースライン起点月"] = t.apply(lambda r: meta[_k(r)]["baseline_origin"], axis=1)
     t["リセット回数"] = t.apply(lambda r: meta[_k(r)]["reset_count"], axis=1)
     t["直近リセット月"] = t.apply(lambda r: meta[_k(r)]["last_reset"], axis=1)
+    t["先行機種数"] = t.apply(lambda r: meta[_k(r)].get("leader_count"), axis=1)
+    t["集団レベル"] = t.apply(lambda r: meta[_k(r)].get("earlylife_level"), axis=1)
     t["アラート種別"] = t.apply(lambda r: _alert_kind(r["alert_drift"], r["alert_spike"], r["alert_burst"]), axis=1)
 
     cols = {
@@ -572,7 +671,8 @@ def build_tableau(table: pd.DataFrame, meta: dict, cfg: dict) -> pd.DataFrame:
     }
     t = t.rename(columns=cols)
     ordered = list(cols.values()) + ["アラート種別", "注目度", "最新状態", "単位注目度",
-                                     "基準モード", "現ベースライン起点月", "リセット回数", "直近リセット月"]
+                                     "基準モード", "現ベースライン起点月", "リセット回数", "直近リセット月",
+                                     "先行機種数", "集団レベル"]
     return t[ordered].sort_values(["事業コード", "開発コード", "部番", "年月"]).reset_index(drop=True)
 
 
