@@ -472,10 +472,12 @@ def replay_unit(unit: pd.DataFrame, base, mode: str, plan: ReplayPlan, cfg: dict
 # ============================================================================
 # 状態解決
 # ============================================================================
-def resolve_state(events: list[dict], rep: pd.DataFrame, ym: int,
+def resolve_state(events: list[dict], ranged: bool, ym: int,
                   machine_end: int | None, plan: ReplayPlan):
-    row = rep[rep["ym"] == ym]
-    ranged = bool(row["total_alert"].iloc[0]) if not row.empty else False
+    """ranged: その月に total_alert が立っていたか（呼び出し側で itertuples から直接渡す。
+    以前は rep 全体を rep[rep['ym']==ym] で毎回再フィルタしていたが、
+    月数×月数のO(n^2)になり機種数が多い実データで支配的なボトルネックになっていたため、
+    呼び出し側が既に持っている値をそのまま渡す形に変更（結果は数値的に完全一致）。"""
 
     if machine_end is not None and machine_end <= ym:
         return dict(state="終了(機種)", kind="-", reevaluation_due=False, ranged=ranged)
@@ -527,7 +529,7 @@ def evaluate_units(units_df: pd.DataFrame, ledger: pd.DataFrame, cfg: dict, asof
         if rep.empty:
             continue
 
-        states = [resolve_state(events, rep, int(r.ym), machine_end.get((biz, dev)), plan)
+        states = [resolve_state(events, bool(r.total_alert), int(r.ym), machine_end.get((biz, dev)), plan)
                   for r in rep.itertuples()]
         rep = rep.assign(state=[s["state"] for s in states],
                          reevaluation_due=[s["reevaluation_due"] for s in states])
