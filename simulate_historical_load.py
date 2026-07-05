@@ -14,7 +14,7 @@ simulate_historical_load.py
   毎月何件浮かび上がったか」を実測する。パラメータの最終健全性チェックや、
   運用開始前の「初月に一気に積み残しが出るのでは」という不安の解消に使う。
 
-使い方
+使い方1
 ------
     import state_logic_cusum as s
     from simulate_historical_load import simulate_monthly_load
@@ -29,6 +29,28 @@ simulate_historical_load.py
     monthly, details, ledger = simulate_monthly_load(
         units, cfg, assumed_disposition="ノイズ")   # まずはニュートラルに消し込む想定
     print(monthly)                                   # 年月ごとの件数
+    monthly.to_csv("月次件数_過去再生.csv", index=False, encoding="utf-8-sig")
+    details.to_csv("月次件数_詳細_過去再生.csv", index=False, encoding="utf-8-sig")
+
+    import pandas as pd
+    import state_logic_cusum as s
+    from simulate_historical_load import simulate_monthly_load, compare_dispositions
+
+使い方2
+------
+    cfg = dict(s.CONFIG)
+    cfg.update(R=..., h=..., alpha_spike=..., min_count=..., burst_window=...)  # 決めた操作点
+
+    raw = pd.read_csv("実データpanel_補正済み.csv")
+    panel = s._prepare_panel(raw, cfg)
+    units = s.aggregate_units(panel)
+
+    # まず幅を見る（楽観/現実的な両方）
+    cmp = compare_dispositions(units, cfg)
+    cmp.to_csv("月次件数_比較.csv", index=False, encoding="utf-8-sig")
+
+    # 本命の想定（実運用に近い処置区分を選ぶ）で詳細を見る
+    monthly, details, ledger = simulate_monthly_load(units, cfg, assumed_disposition="対策中")
     monthly.to_csv("月次件数_過去再生.csv", index=False, encoding="utf-8-sig")
     details.to_csv("月次件数_詳細_過去再生.csv", index=False, encoding="utf-8-sig")
 
