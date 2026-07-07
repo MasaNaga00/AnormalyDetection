@@ -445,10 +445,19 @@ def replay_unit(unit: pd.DataFrame, base, mode: str, plan: ReplayPlan, cfg: dict
 
         S, alarm_d, k = cm.poisson_cusum(
             usage, fleet, lam, R, h, reset_after_alarm=cfg["reset_after_alarm"])
-        p_s, a_s, p_b, a_b = cm.spike_test(
-            usage, fleet, lam, cfg["alpha_spike"], min_count=cfg["min_count"],
-            burst_window=cfg["burst_window"], alpha_burst=cfg["alpha_burst"],
-            baseline_count=C, baseline_exposure=E)
+        if cfg.get("alpha_spike") is None:
+            # スパイク検定オフ（cusum_monitor の evaluate 層と同じ扱い）。
+            # ドリフトのみで監視する。p値はNaN・スパイク/バーストは非発火で埋める。
+            nseg = len(usage)
+            p_s = np.full(nseg, np.nan)
+            a_s = np.zeros(nseg, dtype=bool)
+            p_b = np.full(nseg, np.nan)
+            a_b = np.zeros(nseg, dtype=bool)
+        else:
+            p_s, a_s, p_b, a_b = cm.spike_test(
+                usage, fleet, lam, cfg["alpha_spike"], min_count=cfg["min_count"],
+                burst_window=cfg["burst_window"], alpha_burst=cfg["alpha_burst"],
+                baseline_count=C, baseline_exposure=E)
 
         lam_arr = np.asarray(lam, dtype=float)
         if lam_arr.ndim == 0:
@@ -568,7 +577,8 @@ def attention_score(S: float, h: float, p_spike: float, p_burst: float, cfg: dic
     ps = [p for p in (p_spike, p_burst)
           if p is not None and not (isinstance(p, float) and math.isnan(p))]
     p_eff = max(min(ps), 1e-12) if ps else 1.0
-    spike = (math.log(p_eff) / math.log(cfg["alpha_spike"])) if cfg["alpha_spike"] < 1 else 0.0
+    a_sp = cfg.get("alpha_spike")
+    spike = (math.log(p_eff) / math.log(a_sp)) if (a_sp is not None and a_sp < 1) else 0.0
     return float(max(drift, spike))
 
 
