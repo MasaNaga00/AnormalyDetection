@@ -71,7 +71,12 @@ CONFIG: dict = {
     "baseline_len": 12,
     "monitor_end_m": 60,      # 妥当性ウィンドウ上限（経過月）。末期は監視対象外
     "lambda0_floor": 1e-6,
-    "floor_drift_off": False,  # True でベースライン0件の単位のドリフト検知を停止（スパイクは継続）
+    # ベースライン窓の修理件数 C がこの値未満の単位はドリフト検知を停止（スパイクは継続）。
+    # None で無効（従来どおり）。1 なら C=0 のみ、5 なら C=0〜4 が対象。
+    # lambda0 の相対誤差は約 1/sqrt(C) なので、C が小さい単位の lambda0 は推定値と呼べず、
+    # k がほぼ0になって S が「修理件数の累計カウンタ」に化ける（資料5の教訓と同根）。
+    "drift_min_baseline_count": None,
+    "baseline_prior": None,    # fit_baseline_prior() の (a,b)。集団が均質なときのみ有効（下記注意）
     "min_leaders": 3,
     # --- 安定化前カーブ（earlylife_baseline へ渡す。フェーズ2）---
     # 集団の階層フォールバック（細→粗）。各階層のキー列が揃っていて、かつ先行機種が
@@ -211,14 +216,80 @@ def load_ledger(cfg: dict, df: pd.DataFrame | None = None) -> pd.DataFrame:
 def estimate_baseline(unit: pd.DataFrame, cfg: dict):
     """安定期モードの自己ベースライン。
     Returns (lambda0, C, E): lambda0=平常レート, C=窓内使用数合計, E=窓内販売台数合計。
-    C,E は spike_test の条件付き二項検定（baseline_count/baseline_exposure）に渡す。"""
+    C,E は spike_test の条件付き二項検定（baseline_count/baseline_exposure）に渡す。
+
+    cfg["baseline_prior"] = (a, b) が入っていれば Gamma-Poisson 縮約を使う:
+
+        lambda0 = (C + a) / (E + b)
+
+    C が小さいほど群平均 a/b へ、大きいほど自己実績 C/E へ連続的に寄る。
+    lambda0_floor（定数）を当てると k がほぼ0になり S が「修理件数の累計カウンタ」に
+    化ける病理（資料5の保留単位の教訓と同根）を、境界を引かずに解消する。
+    **C, E は生値のまま返す**：spike_test の条件付き二項は生の (C,E) で正確なので、
+    縮約するのはドリフト用の lambda0 だけにする。
+    prior は fit_baseline_prior() で母集団から推定して cfg に入れておくこと。"""
     lo = cfg["stable_start_m"]
     hi = lo + cfg["baseline_len"]      # [lo, hi)
     w = unit[(unit["elapsed"] >= lo) & (unit["elapsed"] < hi)]
     C = float(w["use"].sum())
     E = float(w["fleet"].sum())
+
+    prior = cfg.get("baseline_prior")
+    if prior is not None and E > 0:
+        a, b = float(prior[0]), float(prior[1])
+        return max((C + a) / (E + b), cfg["lambda0_floor"]), C, E
+
     lam = cm.estimate_lambda0(w["use"].to_numpy(), w["fleet"].to_numpy())
     return max(float(lam), cfg["lambda0_floor"]), C, E
+
+
+def fit_baseline_prior(units_df: pd.DataFrame, cfg: dict,
+                       max_prior_frac: float = 0.25, verbose: bool = True):
+    """安定期単位のベースラインレート分布から Gamma 事前 (a, b) をモーメント法で推定する。
+
+    earlylife_baseline.estimate_earlylife_curve と同じ経験ベイズの流儀。
+        m = mean(C_i/E_i), v = var(C_i/E_i)
+        a = m^2 / v,  b = m / v      （a/b = m = 群平均レート、b = 事前の露出相当量）
+
+    max_prior_frac: b が典型的な E の何割を超えないよう上限を掛ける。
+        事前が強すぎると自己実績が反映されなくなるため。
+
+    Returns (a, b)。cfg["baseline_prior"] に入れて使う。"""
+    lo = cfg["stable_start_m"]
+    hi = lo + cfg["baseline_len"]
+    rates, Es = [], []
+    for _, u in units_df.groupby(["biz", "dev", "part"], sort=False):
+        if classify_mode(u, cfg) != "安定期":
+            continue
+        w = u[(u["elapsed"] >= lo) & (u["elapsed"] < hi)]
+        E = float(w["fleet"].sum())
+        if E <= 0:
+            continue
+        rates.append(float(w["use"].sum()) / E)
+        Es.append(E)
+    if len(rates) < 2:
+        if verbose:
+            print("[fit_baseline_prior] 安定期単位が2件未満。prior を作れません。")
+        return None
+
+    r = np.asarray(rates, dtype=float)
+    m = float(np.mean(r))
+    v = float(np.var(r, ddof=1))
+    if m <= 0 or v <= 0:
+        if verbose:
+            print("[fit_baseline_prior] レートの平均または分散が0。prior を作れません。")
+        return None
+
+    a, b = m * m / v, m / v
+    b_cap = max_prior_frac * float(np.median(Es))     # 事前が自己実績を潰さないよう上限
+    if b > b_cap:
+        a, b = m * b_cap, b_cap                        # a/b = m を保ったまま強度だけ下げる
+    if verbose:
+        print(f"[fit_baseline_prior] 安定期 {len(r)}単位  群平均レート={m:.3e}  "
+              f"事前強度 b={b:.3g} (E中央値の{b/np.median(Es):.1%})  a={a:.3g}")
+        print(f"  → C=0 の単位は lambda0 = a/(E+b) に縮約される"
+              f"（E中央値なら {a/(np.median(Es)+b):.3e}）")
+    return (a, b)
 
 
 def classify_mode(unit: pd.DataFrame, cfg: dict) -> str:
@@ -452,8 +523,9 @@ def replay_unit(unit: pd.DataFrame, base, mode: str, plan: ReplayPlan, cfg: dict
         # ドリフト検知は lambda0 の推定を前提とするので、ここは黙らせるのが正しい。
         # 一方スパイクの条件付き二項は生の (C,E) で成立し C=0 でも正確なので、そのまま動かす。
         lam_drift = lam
-        if (cfg.get("floor_drift_off") and not is_array
-                and C is not None and float(C) <= 0.0):
+        _thr = cfg.get("drift_min_baseline_count")
+        if (_thr is not None and not is_array
+                and C is not None and float(C) < float(_thr)):
             lam_drift = 0.0
         S, alarm_d, k = cm.poisson_cusum(
             usage, fleet, lam_drift, R, h, reset_after_alarm=cfg["reset_after_alarm"])
