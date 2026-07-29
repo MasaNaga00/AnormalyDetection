@@ -71,6 +71,7 @@ CONFIG: dict = {
     "baseline_len": 12,
     "monitor_end_m": 60,      # 妥当性ウィンドウ上限（経過月）。末期は監視対象外
     "lambda0_floor": 1e-6,
+    "floor_drift_off": False,  # True でベースライン0件の単位のドリフト検知を停止（スパイクは継続）
     "min_leaders": 3,
     # --- 安定化前カーブ（earlylife_baseline へ渡す。フェーズ2）---
     # 集団の階層フォールバック（細→粗）。各階層のキー列が揃っていて、かつ先行機種が
@@ -443,8 +444,19 @@ def replay_unit(unit: pd.DataFrame, base, mode: str, plan: ReplayPlan, cfg: dict
         else:
             lam, C, E = plan.baseline_at(seg_start_ym, base)
 
+        # --- floor 単位のドリフト無効化（cfg["floor_drift_off"]=True のとき）---
+        # ベースライン窓に修理実績が無い単位は estimate_baseline が
+        # max(0, lambda0_floor) = 1e-6 を返す。これは推定値ではなく定数なので、
+        # k=(R-1)*lambda0*fleet/lnR がほぼ0になり、S が「修理件数の累計カウンタ」に
+        # 成り下がる（reset_after_alarm=False なので無限に伸び、注目度上位を占有する）。
+        # ドリフト検知は lambda0 の推定を前提とするので、ここは黙らせるのが正しい。
+        # 一方スパイクの条件付き二項は生の (C,E) で成立し C=0 でも正確なので、そのまま動かす。
+        lam_drift = lam
+        if (cfg.get("floor_drift_off") and not is_array
+                and C is not None and float(C) <= 0.0):
+            lam_drift = 0.0
         S, alarm_d, k = cm.poisson_cusum(
-            usage, fleet, lam, R, h, reset_after_alarm=cfg["reset_after_alarm"])
+            usage, fleet, lam_drift, R, h, reset_after_alarm=cfg["reset_after_alarm"])
         if cfg.get("alpha_spike") is None:
             # スパイク検定オフ（cusum_monitor の evaluate 層と同じ扱い）。
             # ドリフトのみで監視する。p値はNaN・スパイク/バーストは非発火で埋める。
