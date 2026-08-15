@@ -127,12 +127,17 @@ def _peer_compare(u: pd.DataFrame, key: list, min_peers: int,
 
 
 def run_signal_b(panel: pd.DataFrame, elapsed_cap: int = 36, min_peers: int = 2,
-                 alpha_peer: float = 0.005, min_count: int = 3,
+                 alpha_peer: float = 0.005, min_count: int = 3, min_oe: float = 1.5,
                  nb_strat: bool = True, require_full: bool = True,
                  two_pass: bool = True) -> pd.DataFrame:
     """信号Bの本体。全 (機種, biz, SF) について、同群のピアと比較した結果を返す。
 
     min_peers : ピア機種が何台以上そろっていれば判定するか（未満は監視不能＝沈黙）
+    min_oe    : **主レバー**。ピア比がこの倍率以上のときだけ発火させる。
+                件数Cが数百になるとp値は桁で吹き飛び、O/E=1.2 でも p<1e-3 になる。
+                機種は正当な理由（設計世代・市場構成）でも差が出る＝過分散があるので、
+                統計的有意性だけでは実務的に無意味な発火が混ざる。効果量で切る。
+    alpha_peer: 補助レバー。件数が少ない群での偶然を落とすためのガード。
     nb_strat  : True なら nb が一致する機種同士だけを比較（推奨）
     two_pass  : 1パス目で発火した機種をピアプールから外して再計算する。
                 同群に複数の異常機種があると基準が押し上げられて互いに
@@ -146,7 +151,7 @@ def run_signal_b(panel: pd.DataFrame, elapsed_cap: int = 36, min_peers: int = 2,
         return u
 
     if two_pass:
-        bad = (u["p"] <= alpha_peer) & (u["C"] >= min_count) & (u["O_E"] > 1.0)
+        bad = (u["p"] <= alpha_peer) & (u["C"] >= min_count) & (u["O_E"] >= min_oe)
         if bad.any():
             flag = u0.merge(u.loc[bad, ["biz", "sf", "dev"]].assign(_x=True),
                             on=["biz", "sf", "dev"], how="left")["_x"].fillna(False)
@@ -157,13 +162,15 @@ def run_signal_b(panel: pd.DataFrame, elapsed_cap: int = 36, min_peers: int = 2,
                                on=["biz", "sf", "dev"], how="left")["_y"].isna()
                 u = pd.concat([u[keep.to_numpy()], u2], ignore_index=True)
 
-    u["alert_peer"] = (u["p"] <= alpha_peer) & (u["C"] >= min_count) & (u["O_E"] > 1.0)
+    u["alert_peer"] = ((u["p"] <= alpha_peer) & (u["C"] >= min_count)
+                       & (u["O_E"] >= min_oe))
 
-    la = math.log(alpha_peer)
-    u["注目度"] = [
-        min(math.log(max(p, 1e-300)) / la, 3.0) if (oe is not None and oe > 1.0) else 0.0
-        for p, oe in zip(u["p"], u["O_E"])
-    ]
+    # 注目度は O/E ベース（p値は桁が飛びすぎて並び順の物差しにならない）。
+    # min_oe で1.0、min_oe の3倍で上限3.0 になる線形スケール。
+    u["注目度"] = np.where(
+        u["O_E"] >= min_oe,
+        np.minimum(1.0 + 2.0 * (u["O_E"] - min_oe) / max(2.0 * min_oe, 1e-9), 3.0),
+        0.0).round(3)
 
     cols = ["biz", "sf", "dev", "nb", "n_peers", "C", "E", "expected",
             "O_E", "p", "peer_rate", "alert_peer", "注目度", "cover"]

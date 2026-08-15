@@ -117,7 +117,9 @@ def run_signal_c(panel: pd.DataFrame, cols: dict, base_len: int = 12,
                  alpha: float = 0.005, min_count: int = 3,
                  min_base_months: int = 6, min_base_count: float = 3.0,
                  asof_ym: int | None = None, months_back: int = 0,
-                 all_token: str = ALL_TOKEN) -> pd.DataFrame:
+                 all_token: str = ALL_TOKEN,
+                 horizon: dict | None = None,
+                 revisit_months: int = 0) -> pd.DataFrame:
     """信号Cの本体。
 
     asof_ym     : 判定基準月。None ならパネル最新月。
@@ -125,27 +127,50 @@ def run_signal_c(panel: pd.DataFrame, cols: dict, base_len: int = 12,
                   判定し、過去例の再現確認・バックテストに使う。
     min_base_months : ベースラインに必要な最低月数（左側打ち切り対策）
     min_base_count  : ベースライン窓の最低使用数（薄すぎる窓での判定を避ける）
+
+    ▼ 販社別の報告遅れへの対応（reporting_horizon.py と対で使う）
+    horizon        : {販社: 完全と見なせる最終年月}。指定すると
+                     (a) その月より後ろを系列から**切り落としてから**検定する
+                         （未確定月がローリングベースラインを下振れさせるのを防ぐ）
+                     (b) 判定対象月もその販社の horizon までに制限する
+    revisit_months : 直近この月数を毎回さかのぼって再判定する。
+                     **0 のままだと遅れている販社の月は永久に一度も検定されない。**
+                     販社の最大遅れ月数以上にすること（reporting_horizon.check_revisit）。
+
+    horizon=None かつ revisit_months=0 なら従来と完全に同じ挙動になる。
     """
     d = prepare_dist_panel(panel, cols, all_token=all_token)
     if d.empty:
         return d
     T = int(asof_ym) if asof_ym is not None else int(d["ym"].max())
 
+    lo = _shift_ym(T, -(int(months_back) + int(revisit_months)))
+
     rows = []
     for (biz, dev, part, dist), g in d.groupby(["biz", "dev", "part", "dist"], sort=False):
         g = g.sort_values("ym").reset_index(drop=True)
+
+        # --- 販社ごとの完全月で系列を切る ---------------------------------
+        # 切ってから検定するのが要点。未確定（部分的にしか届いていない）月を
+        # ローリングベースラインに残すとレートが下振れし、翌月が鳴りやすくなる。
+        Td = T if horizon is None else min(T, int(horizon.get(dist, T)))
+        g = g[g["ym"] <= Td]
+        if g.empty:
+            continue
+
         use = g["use"].to_numpy(dtype=float)
         fleet = g["fleet"].to_numpy(dtype=float)
         p, al, oe, br = _rolling_test(use, fleet, base_len, alpha, min_count,
                                       min_base_months, min_base_count)
         ym = g["ym"].to_numpy()
-        sel = np.flatnonzero((ym <= T) & (ym >= _shift_ym(T, -months_back)))
+        sel = np.flatnonzero((ym <= Td) & (ym >= lo))
         for t in sel:
             rows.append(dict(
                 biz=biz, dev=dev, part=part, dist=dist, ym=int(ym[t]),
                 use=use[t], fleet=fleet[t], base_rate=br[t],
                 expected=br[t] * fleet[t] if not np.isnan(br[t]) else np.nan,
                 O_E=oe[t], p=p[t], alert_dist=bool(al[t]),
+                run_ym=T, 遅延月=_diff_ym(T, int(ym[t])),
             ))
     out = pd.DataFrame(rows)
     if out.empty:
@@ -161,6 +186,12 @@ def _shift_ym(ym: int, k: int) -> int:
     y, m = divmod(int(ym), 100)
     idx = y * 12 + (m - 1) + k
     return (idx // 12) * 100 + (idx % 12) + 1
+
+
+def _diff_ym(a: int, b: int) -> int:
+    ya, ma = divmod(int(a), 100)
+    yb, mb = divmod(int(b), 100)
+    return (ya * 12 + ma) - (yb * 12 + mb)
 
 
 def summarize_by_unit(res: pd.DataFrame) -> pd.DataFrame:
