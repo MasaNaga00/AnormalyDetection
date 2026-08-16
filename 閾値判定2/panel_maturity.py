@@ -183,17 +183,66 @@ def explain(panel: pd.DataFrame, cols: dict, target: float = 0.95,
 # ============================================================================
 def save_snapshot(panel: pd.DataFrame, cols: dict, extract_ym: int,
                   outdir: str = "スナップショット",
-                  all_token: str = "ALL") -> str:
+                  all_token: str = "ALL",
+                  archive: bool = True) -> str:
     """抽出時点つきで販社×受付月の集計だけを保存する（軽量）。
 
     生パネルを丸ごと保存する必要はない。あとで発展表を組むのに要るのは
     販社×受付月の使用数計だけ。1回あたり数KB。
+
+    同月に複数回実行した場合
+    ------------------------
+    ファイル名は受付月ベースの `snap_YYYYMM.csv` なので **上書き**される。
+    これは意図的:
+
+      発展表の遅れ軸は「月」単位なので、同じ月の複数時点を両方残すと、
+      違う熟成度の観測が同じ遅れ k に混ざって ρ(k) が歪む。
+      最後の1本（＝最も出そろっている）だけを残すのが正しい。
+
+    ただし上書きで失われると困る場合に備えて、既存ファイルは
+    `outdir/履歴/` に日時つきで退避する（archive=True）。
+    履歴はサブフォルダなので build_triangle の glob には拾われない。
+
+    あわせて `snapshot_log.csv` に1行追記する（追記のみ・上書きしない）。
+    いつ・どのパネルで保存したかの監査証跡になる。
     """
+    import datetime as _dt
     os.makedirs(outdir, exist_ok=True)
+    path = os.path.join(outdir, f"snap_{int(extract_ym)}.csv")
+    now = _dt.datetime.now()
+
+    # --- 既存があれば履歴へ退避 ---
+    replaced = None
+    if archive and os.path.exists(path):
+        hist = os.path.join(outdir, "履歴")
+        os.makedirs(hist, exist_ok=True)
+        old_ts = _dt.datetime.fromtimestamp(os.path.getmtime(path))
+        dst = os.path.join(hist, f"snap_{int(extract_ym)}_{old_ts:%Y%m%d_%H%M%S}.csv")
+        try:
+            os.replace(path, dst)
+            replaced = dst
+        except OSError:
+            pass
+
     g = dist_monthly(panel, cols, all_token)
     g.insert(0, "抽出年月", int(extract_ym))
-    path = os.path.join(outdir, f"snap_{int(extract_ym)}.csv")
+    g.insert(1, "保存日時", now.strftime("%Y-%m-%d %H:%M:%S"))
     g.to_csv(path, index=False, encoding="utf-8-sig")
+
+    # --- 監査ログ（追記のみ）---
+    log = os.path.join(outdir, "snapshot_log.csv")
+    cov = (g.groupby("dist")["ym"].max().astype(int).to_dict()
+           if len(g) else {})
+    rec = pd.DataFrame([dict(
+        保存日時=now.strftime("%Y-%m-%d %H:%M:%S"),
+        抽出年月=int(extract_ym),
+        販社数=int(g["dist"].nunique()) if len(g) else 0,
+        行数=int(len(g)),
+        使用数計=float(g["使用数計"].sum()) if len(g) else 0.0,
+        販社別最終月=str(cov),
+        上書き退避先=(os.path.basename(replaced) if replaced else ""))])
+    rec.to_csv(log, mode="a", index=False, header=not os.path.exists(log),
+               encoding="utf-8-sig")
     return path
 
 
@@ -208,6 +257,16 @@ def build_triangle(outdir: str = "スナップショット") -> pd.DataFrame:
         raise ValueError(f"スナップショットが {len(files)} 件しかない。2件以上必要。")
     df = pd.concat([pd.read_csv(f, encoding="utf-8-sig") for f in files],
                    ignore_index=True)
+    # 念のための重複ガード（同じ抽出年月のファイルが何らかの理由で
+    # 複数混ざった場合、同じ遅れ k に違う熟成度が混ざって ρ(k) が歪む）
+    key = ["抽出年月", "dist", "ym"]
+    n0 = len(df)
+    if "保存日時" in df.columns:
+        df = df.sort_values("保存日時")
+    df = df.drop_duplicates(subset=key, keep="last")
+    if len(df) < n0:
+        print(f"[注意] 重複を {n0 - len(df)} 行落としました"
+              "（同じ抽出年月の観測が複数ありました。最後のものを採用）")
     df["遅れ"] = [diff_ym(int(e), int(m))
                 for e, m in zip(df["抽出年月"], df["ym"])]
     df = df[df["遅れ"] >= 0]

@@ -7,6 +7,7 @@ run_month.py — 月次運用の実行スクリプト（毎月これを叩く）
     python run_month.py panel_初回.csv 台帳_空.xlsx
     python run_month.py panel_翌月.csv 台帳.xlsx
     python run_month.py panel.csv 台帳.xlsx 出力先フォルダ
+    python run_month.py panel.csv 台帳.xlsx --no-snapshot   # 試し実行（熟成カーブを汚さない）
 
 出力
 ----
@@ -46,7 +47,8 @@ REVIEW_COLS = ["事業コード", "開発コード", "部番", "検出器", "対
 SNAP_DIR = "スナップショット"
 
 
-def main(panel_path: str, ledger_path: str, out_root: str = OUT_ROOT):
+def main(panel_path: str, ledger_path: str, out_root: str = OUT_ROOT,
+         save_snapshot: bool = True):
     raw = pd.read_csv(panel_path, encoding="utf-8-sig")
 
     # --- 投入前チェック（既存の手順A）---
@@ -95,13 +97,25 @@ def main(panel_path: str, ledger_path: str, out_root: str = OUT_ROOT):
     # --- 熟成カーブ較正用のスナップショット（毎月ためる。1回数KB）---
     # これだけが「受付月の値が抽出のたびにどれだけ増えるか」を測る手段。
     # 貯め始めが遅れるとその分だけ較正が後ろにずれるので、初回から必ず残す。
-    try:
-        snap = pm.save_snapshot(p_dist, COLS, T,
-                                outdir=os.path.join(out_root, SNAP_DIR),
-                                all_token=st.ALL_TOKEN)
-        print(f"スナップショット保存: {snap}")
-    except Exception as e:
-        print(f"[警告] スナップショット保存に失敗: {e}")
+    # 同月に複数回実行すると snap_YYYYMM.csv は**上書き**される（意図的。
+    # 遅れ軸が月単位なので、同じ月の複数時点を残すと ρ(k) が歪むため）。
+    # 上書き前のファイルは 履歴/ に退避され、snapshot_log.csv に追記される。
+    # 部分的なパネルや切り出しデータで試すときは --no-snapshot を付けること。
+    if not save_snapshot:
+        print("スナップショット保存: スキップ（--no-snapshot）")
+    else:
+        try:
+            snapdir = os.path.join(out_root, SNAP_DIR)
+            existed = os.path.exists(os.path.join(snapdir, f"snap_{T}.csv"))
+            snap = pm.save_snapshot(p_dist, COLS, T, outdir=snapdir,
+                                    all_token=st.ALL_TOKEN)
+            if existed:
+                print(f"スナップショット保存: {snap}"
+                      f"  （同月の既存分を上書き。旧版は 履歴/ に退避）")
+            else:
+                print(f"スナップショット保存: {snap}")
+        except Exception as e:
+            print(f"[警告] スナップショット保存に失敗: {e}")
 
     # --- 報告遅れの状況を先に見せる（発火件数の読み方が変わるため）---
     hr = r.get("horizon_report")
@@ -137,8 +151,11 @@ def main(panel_path: str, ledger_path: str, out_root: str = OUT_ROOT):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 3:
+    argv = [a for a in sys.argv[1:] if not a.startswith("--")]
+    flags = {a for a in sys.argv[1:] if a.startswith("--")}
+    if len(argv) < 2:
         print(__doc__)
         sys.exit(1)
-    main(sys.argv[1], sys.argv[2],
-         sys.argv[3] if len(sys.argv) > 3 else OUT_ROOT)
+    main(argv[0], argv[1],
+         argv[2] if len(argv) > 2 else OUT_ROOT,
+         save_snapshot=("--no-snapshot" not in flags))
