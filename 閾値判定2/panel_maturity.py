@@ -132,14 +132,19 @@ def recommend_horizon(panel: pd.DataFrame, cols: dict, target: float = 0.95,
                       safety_margin: int = 1, **kw) -> tuple:
     """(受付月horizon dict, 推奨 C_REVISIT_MONTHS) を返す。
 
-    ρ(k) が target 以上になる最小の k を採る。ただし ρ は単調とは限らない
-    （偶然の上振れで浅い k が先に条件を満たすことがある）ので、
-    **その k 以降がすべて target 以上**であることを条件にする。
+    判定規則（ノイズ耐性つき）
+    --------------------------
+    ρ(k) は「k ヶ月前の受付月が何割出そろっているか」だが、**成熟した領域では
+    単に月ごとの実変動を測っているだけ**になる。ある月に本当に多く修理が
+    入っていれば ρ=2、静かな月なら ρ=0.5 になる。これは打ち切りではない。
+
+    そこで「ρ(k) 以降がすべて target 以上」ではなく
+    **「ρ(k) 以降の中央値が target 以上」** を採る。1点の落ち込みで
+    推奨値が max_lag に跳ね上がるのを防ぐ。
 
     safety_margin : そのうえで k をさらに何ヶ月伸ばすか（既定1）。
-        推定 ρ は標本ゆらぎで上振れすることがあり、**浅く見積もる誤りは
-        未確定月を判定に入れてしまう＝誤報方向**なので危険。深く見積もる
-        誤りは再評価窓で拾い直されるだけ。非対称なので既定で1ヶ月積む。
+        浅く見積もる誤り（未確定月を判定に入れる＝誤報方向）は危険、
+        深く見積もる誤りは再評価窓で拾い直されるだけ。非対称なので1ヶ月積む。
     """
     cur = maturity_curve(panel, cols, max_lag, all_token=all_token, **kw)
     g = dist_monthly(panel, cols, all_token)
@@ -151,15 +156,67 @@ def recommend_horizon(panel: pd.DataFrame, cols: dict, target: float = 0.95,
         else:
             vals = [getattr(r, f"k{i}") for i in range(0, max_lag + 1)]
             k = max_lag
-            for i in range(max_lag, -1, -1):
-                v = vals[i]
-                if v is None or v != v or v < target:
+            for i in range(0, max_lag + 1):
+                tail = [v for v in vals[i:] if v is not None and v == v]
+                if not tail:
+                    continue
+                if float(np.median(tail)) >= target and vals[i] == vals[i] \
+                        and vals[i] >= target * 0.9:
+                    k = i
                     break
-                k = i
         k = min(int(k) + int(safety_margin), max_lag)
         hz[r.販社] = shift_ym(T, -k)
         lags.append(k)
     return hz, int(max(lags)) if lags else 0
+
+
+def suggest_settings(panel: pd.DataFrame, cols: dict, target: float = 0.95,
+                     max_lag: int = 8, all_token: str = "ALL",
+                     safety_margin: int = 1, **kw) -> dict:
+    """settings.py にそのまま貼れる形で推奨値を出す。
+
+    2つの書き方があるので両方出す。
+
+    HORIZON_MARGIN_OVERRIDES（推奨）
+        {販社: 月数}。**その販社自身の最終月から何ヶ月落とすか**の相対指定。
+        毎月の更新が要らない。基本はこちらを使う。
+
+    HORIZON_FIXED（一時的な固定用）
+        {販社: YYYYMM}。**絶対値**なので、翌月には古くなる。
+        毎月書き換える前提でないと使えない。受領管理表の実測値を
+        一時的に入れるときや、特定月だけ手当てするときに使う。
+    """
+    hz, K = recommend_horizon(panel, cols, target, max_lag, all_token,
+                              safety_margin, **kw)
+    g = dist_monthly(panel, cols, all_token)
+    T = int(g["ym"].max())
+    last = g.groupby("dist")["ym"].max().astype(int).to_dict()
+
+    ov = {}
+    for dist, h in hz.items():
+        # margin は「その販社の最終月」からの相対。負なら0でよい。
+        ov[dist] = max(0, diff_ym(int(last[dist]), int(h)))
+
+    print("=" * 66)
+    print(f"settings.py に貼る（最新月 T={T} / 完成度目標 {target:.0%}）")
+    print("=" * 66)
+    print(f"C_REVISIT_MONTHS = {K}")
+    print("HORIZON_MARGIN_OVERRIDES = {")
+    for d in sorted(ov):
+        print(f'    "{d}": {ov[d]},'
+              f'   # 最終月{last[d]} → horizon {hz[d]}'
+              f'（Tから{diff_ym(T, hz[d])}ヶ月前）')
+    print("}")
+    print("\n# 絶対値で固定したい場合のみ（毎月書き換えが必要）")
+    print("HORIZON_FIXED = {")
+    for d in sorted(hz):
+        print(f'    "{d}": {hz[d]},')
+    print("}")
+    print("=" * 66)
+    print("※ 基本は HORIZON_MARGIN_OVERRIDES を使う。HORIZON_FIXED は絶対値なので")
+    print("   翌月には古くなり、そのまま放置すると horizon が進まなくなる。")
+    return dict(C_REVISIT_MONTHS=K, HORIZON_MARGIN_OVERRIDES=ov,
+                HORIZON_FIXED=hz, T=T)
 
 
 def explain(panel: pd.DataFrame, cols: dict, target: float = 0.95,
@@ -173,8 +230,18 @@ def explain(panel: pd.DataFrame, cols: dict, target: float = 0.95,
     g = dist_monthly(panel, cols, all_token)
     T = int(g["ym"].max())
     cur["遅れ月数"] = [diff_ym(T, v) for v in cur["horizon"]]
+    # 成熟領域（後半）のばらつき＝カーブの読みやすさ
+    tail_cols = [f"k{i}" for i in range(max(1, max_lag - 3), max_lag + 1)]
+    tail_cols = [c for c in tail_cols if c in cur.columns]
+    if tail_cols:
+        cur["成熟域中央"] = cur[tail_cols].median(axis=1).round(2)
+        cur["成熟域の幅"] = (cur[tail_cols].max(axis=1)
+                        - cur[tail_cols].min(axis=1)).round(2)
     print(f"[推奨] C_REVISIT_MONTHS = {K}   目標完成度 {target:.0%}   最新月 {T}")
-    print("[確認] k が大きくなるほど ρ が単調に1へ近づいているか目視すること。")
+    print("[読み方] 見るのは**左端（k=0,1,2）が低くて右へ上がるか**だけ。")
+    print("         成熟域(右側)の 0.5 や 2.0 は打ち切りではなく月ごとの実変動。")
+    print("         『成熟域の幅』が 0.5 を超える販社はカーブが読めていないので、")
+    print("         その販社は保守的に max_lag で切るか実態を確認すること。")
     return cur
 
 

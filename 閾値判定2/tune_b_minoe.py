@@ -40,6 +40,10 @@ def scan(panel_path: str, elapsed_cap: int | None = None) -> pd.DataFrame:
     # 列名は settings.COLS を参照する（実データで触るのは settings.py だけ、の原則）
     c_ym = st.COLS["ym"]
     raw[c_ym] = raw[c_ym].astype(str).str.replace(r"\D", "", regex=True).astype(int)
+    # run_month.py と同じ前処理（累積販売台数の逆転を cummax で補正）
+    keys = [st.COLS["biz"], st.COLS["dev"], st.COLS["part"], st.COLS["dist"]]
+    raw = raw.sort_values(keys + [c_ym])
+    raw[st.COLS["cum_sales"]] = raw.groupby(keys)[st.COLS["cum_sales"]].cummax()
     p_all = raw[raw[st.COLS["dist"]].astype(str) == st.ALL_TOKEN]
 
     cfg = dict(sc.CONFIG)
