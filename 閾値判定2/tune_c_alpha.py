@@ -30,7 +30,6 @@ import numpy as np
 import pandas as pd
 
 import signal_c_dist as sd
-import reporting_horizon as rh
 
 import settings as st
 
@@ -44,55 +43,18 @@ LOOKBACK_M = 6          # ラベル評価: 報告月の何ヶ月前まで遡っ�
 
 
 # ============================================================================
-def step1_scan(panel_path: str, out: str = "scan_c.csv",
-               use_horizon: bool | None = None) -> pd.DataFrame:
-    """p値を1回だけ計算して保存する。ここが唯一の重い処理。
-
-    use_horizon : None なら settings.USE_HORIZON に従う。
-        True のとき、販社ごとの完全月（horizon）より後ろを系列から切ってから
-        検定する。本番の run_month と同じ土俵にするため。切らないと、まだ
-        届いていない月が「使用数が少ない月」として混ざり、実際より静かに見える。
-    """
+def step1_scan(panel_path: str, out: str = "scan_c.csv") -> pd.DataFrame:
+    """p値を1回だけ計算して保存する。ここが唯一の重い処理。"""
     raw = pd.read_csv(panel_path, encoding="utf-8-sig")
-    # 列名は settings.COLS を参照する（実データで触るのは settings.py だけ、の原則）
-    c_ym, c_dist = COLS["ym"], COLS["dist"]
-    raw[c_ym] = raw[c_ym].astype(str).str.replace(r"\D", "", regex=True).astype(int)
-    keys = [COLS["biz"], COLS["dev"], COLS["part"], c_dist]
-
-    # ★ run_month.py と同じ前処理を必ず通す。
-    #   累積販売台数の非単調（修正による小さな逆転）を cummax で補正しないと、
-    #   fleet[t] が凹んだ月の expected が小さくなり、O/E が跳ねて**実運用には
-    #   存在しない発火**が混ざる。操作点をそこで決めると本番と合わなくなる。
-    raw = raw.sort_values(keys + [c_ym])
-    before = raw[COLS["cum_sales"]].to_numpy(copy=True)
-    raw[COLS["cum_sales"]] = raw.groupby(keys)[COLS["cum_sales"]].cummax()
-    n_fix = int((raw[COLS["cum_sales"]].to_numpy() != before).sum())
-    if n_fix:
-        print(f"[前処理] 累積販売台数の逆転を {n_fix} 行 cummax で補正しました")
-
-    dist = raw[raw[c_dist].astype(str) != st.ALL_TOKEN].copy()
-    print(f"販社別パネル: {len(dist)}行  系列数={dist.groupby(keys).ngroups}")
-
-    hz = None
-    if use_horizon is None:
-        use_horizon = getattr(st, "USE_HORIZON", False)
-    if use_horizon:
-        hz = rh.estimate_horizon(
-            dist, COLS, all_token=st.ALL_TOKEN,
-            margin_months=getattr(st, "HORIZON_MARGIN_MONTHS", 0),
-            margin_overrides=getattr(st, "HORIZON_MARGIN_OVERRIDES", {}),
-            fixed=getattr(st, "HORIZON_FIXED", {}),
-            auto_margin=getattr(st, "HORIZON_AUTO_MARGIN", True),
-            thin_ratio=getattr(st, "HORIZON_THIN_RATIO", 0.7))
-        T = int(dist[c_ym].max())
-        lag = {k: rh.diff_ym(T, v) for k, v in hz.items()}
-        print(f"horizon: {hz}")
-        print(f"  遅れ月数: {lag}  ← C_REVISIT_MONTHS はこの最大値以上にすること")
+    raw["年月"] = raw["年月"].astype(str).str.replace(r"\D", "", regex=True).astype(int)
+    dist = raw[raw[COLS["dist"]].astype(str) != "ALL"].copy()
+    print(f"販社別パネル: {len(dist)}行  "
+          f"系列数={dist.groupby(['事業コード','開発コード','部番','販社']).ngroups}")
 
     # alpha=1.0 で「全部発火扱い」にして p を残す。min_count は最小に。
+    # スキャンでは足切りしない（min_oe=1.0 で上振れ全件、min_count は最小）
     res = sd.run_signal_c(dist, COLS, alpha=1.0, min_count=SCAN_MIN_COUNT,
-                          months_back=MONTHS_BACK, all_token=st.ALL_TOKEN,
-                          horizon=hz)
+                          min_oe=1.0, min_excess=0.0, months_back=MONTHS_BACK)
     res.to_csv(out, index=False, encoding="utf-8-sig")
     n_p = int(res["p"].notna().sum())
     print(f"判定行={len(res)}  p値を計算した行={n_p}  → {out} に保存")
@@ -128,11 +90,53 @@ def step2_sweep(scan: pd.DataFrame, alphas=ALPHAS, min_counts=MIN_COUNTS,
         tbl["予算内"] = tbl["単位月平均"] <= budget
     print(f"\n=== alpha × min_count スイープ（直近{n_months}ヶ月）===")
     print("  月平均/月最大 = 販社別の発火行数、単位月平均 = 機種×部番に畳んだ件数")
-    print("  ※ これは定常状態の**下限**。実運用では次の2つが上乗せされる:")
-    print("     (1) 初回runは C_REVISIT_MONTHS+1 ヶ月ぶんがまとめて出る")
-    print("     (2) 上位N件に入らず台帳に記録されなかった月は翌月も再登場する")
     print(tbl.to_string(index=False))
     return tbl
+
+
+def step2_oe(scan: pd.DataFrame, min_oes=(1.5, 2.0, 3.0, 4.0, 5.0),
+             alpha: float = 0.005, min_count: int = 3,
+             min_excesses=(0, 3, 5)) -> pd.DataFrame:
+    """**件数が多い系列の小さな変動を落とすための主レバー。**
+
+    p値だけで切ると、ベースラインが大きい系列ほど小さい倍率で有意になる
+    （月50件なら1.42倍で alpha=0.005 を通過する）。倍率で足切りする。
+    """
+    d = scan[scan["p"].notna()].copy()
+    all_ym = sorted(scan["ym"].unique())
+    rows = []
+    for oe in min_oes:
+        for ex in min_excesses:
+            hit = d[(d["O_E"] >= oe) & (d["p"] <= alpha) & (d["use"] >= min_count)
+                    & ((d["use"] - d["expected"]) >= ex)]
+            unit = (hit.groupby(["ym", "biz", "dev", "part"]).size().groupby("ym").size()
+                       .reindex(all_ym, fill_value=0))
+            rows.append(dict(min_oe=oe, min_excess=ex, 総件数=len(hit),
+                             単位月平均=round(unit.mean(), 1),
+                             単位月最大=int(unit.max()),
+                             ベース月平均=round(hit["expected"].mean(), 1) if len(hit) else None))
+    t = pd.DataFrame(rows)
+    print("\n=== min_oe × min_excess（alpha={}, min_count={}）===".format(alpha, min_count))
+    print("  ベース月平均 = 発火した系列のベースライン期待件数。小さいほど『薄い系列』狙い")
+    print(t.to_string(index=False))
+    return t
+
+
+def oe_by_baseline(scan: pd.DataFrame, alpha: float = 0.005) -> pd.DataFrame:
+    """ベースラインの規模別に、発火したもののO/E分布を見る。
+    『件数が多い系列が小さい変動で鳴っている』の実証に使う。"""
+    d = scan[(scan["p"].notna()) & (scan["p"] <= alpha)].copy()
+    if d.empty:
+        print("該当なし"); return d
+    d["ベース規模"] = pd.cut(d["expected"], [0, 1, 3, 10, 30, 1e9],
+                         labels=["〜1件", "1-3件", "3-10件", "10-30件", "30件〜"])
+    t = d.groupby("ベース規模", observed=True).agg(
+        件数=("O_E", "size"), O_E中央=("O_E", "median"),
+        O_E最小=("O_E", "min"), 増加分中央=("use", "median"))
+    print(f"\n=== 発火したもののベースライン規模別 O/E（alpha={alpha}）===")
+    print("  『30件〜』の O_E最小 が小さいほど、大きい系列が小変動で鳴っている")
+    print(t.round(2).to_string())
+    return t
 
 
 def step2b_monthly(scan: pd.DataFrame, alpha: float, min_count: int) -> pd.Series:
@@ -193,58 +197,6 @@ def step3_labels(scan: pd.DataFrame, labels_path: str,
     return tbl
 
 
-def inspect(scan: pd.DataFrame, alpha: float, min_count: int,
-            top: int = 15) -> dict:
-    """選んだ操作点で「何が」鳴っているのかを分解して見る。
-
-    alpha を下げても件数が下げ止まるとき、残っているのは p が極端に小さい
-    ＝ずれが大きい行なので、**alpha では消せない**。信号Bで
-    「主レバーは alpha でなく効果量」と分かったのと同じ構造。
-    そこからは「消す」でなく「本物かどうか」を見る作業になる。
-    """
-    d = scan[scan["p"].notna()]
-    hit = d[(d["p"] <= alpha) & (d["use"] >= min_count)].copy()
-    print(f"=== alpha={alpha}, min_count={min_count} → {len(hit)}件 ===")
-    if hit.empty:
-        return {}
-
-    unit = (hit.groupby(["ym", "biz", "dev", "part"]).size()
-               .groupby("ym").size())
-    print(f"\n[1] 月別の件数（機種×部番単位）  最大={int(unit.max())}"
-          f"  平均={unit.mean():.1f}")
-    print(unit.sort_values(ascending=False).head(6).to_string())
-    print("  → 特定の月に偏っていれば、その月のデータを疑う"
-          "（一括取込・仕様変更・欠測の穴埋めなど）")
-
-    print("\n[2] 販社別")
-    print(hit.groupby("dist").size().sort_values(ascending=False).to_string())
-    print("  → 1販社に偏っていれば、その販社の報告の出方が原因の可能性"
-          "（まとめ送りで1ヶ月に山ができる等）")
-
-    rep = hit.groupby(["biz", "dev", "part"]).size().sort_values(ascending=False)
-    n_rep = int((rep >= 2).sum())
-    print(f"\n[3] 同じ部品の繰り返し: {n_rep}部品が2回以上"
-          f"（延べ{int(rep[rep>=2].sum())}件 / 全{len(hit)}件）")
-    print(rep.head(8).to_string())
-    print("  → **繰り返しは実運用では台帳の抑制で消える。**"
-          " このツールは抑制を考慮しないので件数は過大に出る")
-
-    print("\n[4] 規模の分布")
-    print(hit[["use", "expected", "O_E", "base_rate", "fleet"]]
-          .describe().round(3).to_string())
-    small = hit[hit["use"] < 10]
-    print(f"  使用数10件未満: {len(small)}件 / {len(hit)}件")
-    print("  → 使用数が小さいのに p が極小なら、ベースラインが薄すぎる疑い。"
-          " C_MIN_COUNT を上げるのが効く")
-
-    print(f"\n[5] O/E 上位{top}（本物かどうかを目で見る）")
-    cols = [c for c in ["ym", "dev", "part", "dist", "use", "expected",
-                        "base_rate", "O_E", "p"] if c in hit.columns]
-    print(hit.nlargest(top, "O_E")[cols].to_string(index=False))
-
-    return dict(月別=unit, 販社別=hit.groupby("dist").size(), 部品別=rep, 明細=hit)
-
-
 def _months_between(a: int, b: int) -> int:
     ya, ma = divmod(int(a), 100)
     yb, mb = divmod(int(b), 100)
@@ -291,6 +243,8 @@ if __name__ == "__main__":
         print(__doc__)
         sys.exit(1)
     scan = step1_scan(sys.argv[1])
+    oe_by_baseline(scan)
+    step2_oe(scan)
     tbl = step2_sweep(scan)
     if len(sys.argv) > 2:
         step3_labels(scan, sys.argv[2])

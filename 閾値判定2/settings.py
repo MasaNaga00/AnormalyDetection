@@ -55,7 +55,7 @@ B_MIN_PEERS = 2        # ピア機種がこの数以上そろって初めて判�
 #   件数Cが数百になるとp値は桁で飛ぶ（O/E=1.27でp=6e-4、O/E=2.48でp=1e-58）。
 #   機種は正当な理由でも差が出る（過分散）ので、統計的有意性でなく効果量で切る。
 #   tune_b_minoe.py で実測してから決める。
-B_MIN_OE = 2.0
+B_MIN_OE = 1.5
 
 B_ALPHA = 0.005        # 補助レバー。件数の少ない群での偶然を落とすガード
 B_MIN_COUNT = 3        # この使用数未満は発火させない
@@ -73,48 +73,32 @@ C_BASE_LEN = 12        # 直近何ヶ月をベースラインにするか
 C_ALPHA = 0.005
 
 C_MIN_COUNT = 3        # この使用数未満は発火させない
+
+# ★主レバー: ベースラインの何倍以上で発火させるか。
+#   p値だけで切ると件数の多い系列ほど小さい変化で鳴る（月50件なら1.42倍で有意）。
+#   過去の実例は「ほぼゼロ→突然多数」型なので、倍率で足切りすると狙いが合う。
+C_MIN_OE = 3.0
+
+# 増加の絶対量の下限（件）。0で無効。「1件→4件」のような小さい絶対増を
+# 落としたいときに使う。倍率だけだと薄い系列が鳴りやすいので、その調整弁。
+C_MIN_EXCESS = 0.0
+
+# ★もともと振れの大きい系列を鈍感にするレバー。0で無効。
+#   「その系列が過去12ヶ月に見せた最大の振れ幅 × この値」を超えないと発火しない。
+#   まとめ発注・季節性など、min_oe では止まらない構造的な振れに効く。
+#   振れの小さい通常部品には影響しない（検証済み: 4倍の本物は100%検知のまま）。
+#   目安: 1.2 で「平常時の発火 7.4%→4.7%、本物(8倍)の検知 98.8%→84.5%」
+C_EXCEED_HIST = 0.0
+
+# 信号Cから除外する部番。消耗品など、性質上つねに出入りが多いと分かっているもの。
+#   {"P-1234"} … 全機種で除外
+#   {("M01", "P-1234")} … その機種だけ除外
+C_EXCLUDE = set()
+
 C_MIN_BASE_MONTHS = 6  # ベースラインに必要な最低月数（販社行の左側打ち切り対策）
-C_MIN_BASE_COUNT = 3.0 # ベースライン窓の最低使用数
-
-
-# ============================================================================
-# 4.5 販社の報告遅れ（reporting_horizon.py）
-# ============================================================================
-# 販社ごとに修理データの送付頻度が違う（毎日／週次／月次）。3月上旬に集計すると
-# 月次送付の販社は12月分までしか入っていない、ということが起こる。
-#
-# ★ これを入れないと、遅れている販社の月は信号Cで**一度も検定されない**。
-#   run_signal_c は既定で基準月Tの1ヶ月だけを判定し、翌月もまたTしか見ないため。
-
-USE_HORIZON = True
-
-# 各販社の末尾から落とす月数の既定値。0 のままでよい（下の自動判定が効く）。
-HORIZON_MARGIN_MONTHS = 0
-
-# True: 最終月の使用数計が直前6ヶ月の中央値の HORIZON_THIN_RATIO 未満なら
-#       「まだ月の途中」と見なして margin を +1 する。
-#       月次一括送付の販社は最終月が完結しているので margin 0、
-#       毎日/週次送付の販社は月の途中で切れて薄いので margin 1、が自動で付く。
-HORIZON_AUTO_MARGIN = True
-HORIZON_THIN_RATIO = 0.7
-
-# 送付実態が分かっている販社は手で固定できる（自動判定より優先）。
-#   例: HORIZON_MARGIN_OVERRIDES = {"日本": 0, "米国": 1}
-HORIZON_MARGIN_OVERRIDES = {}
-
-# 受領管理表がある場合はこれが正解。{販社: YYYYMM}
-HORIZON_FIXED = {}
-
-# ★信号Cが毎回さかのぼって再判定する月数。
-#   **販社の最大遅れ月数以上**にすること。足りないと月が永久に未検定になる。
-#   reporting_horizon.report(...) の「遅れ月数」の最大値を見て決める。
-#   迷ったら大きめ（6）にしてよい。既に台帳に記録済みの月は抑制で消える。
-C_REVISIT_MONTHS = 8
-
-# 信号Bを「全販社が揃っている月」で打ち切る。累積O/Eの機種間比較なので、
-# 直近の欠測量が機種の販社構成によって違うと比較が不公平になる。
-# 12ヶ月抑制の遅い検出器なので数ヶ月遅れても実害はない。
-B_TRUNCATE_TO_HORIZON = True
+C_MIN_BASE_COUNT = 0.0 # ベースライン窓の最低使用数。0=制限なし（推奨）。
+                       # 条件付き二項が薄い窓を自動で保守側に開くので不要。
+                       # 3にすると「ほぼゼロ→突然多数」が判定前に消える
 
 
 # ============================================================================
@@ -164,19 +148,13 @@ def build_cfg() -> dict:
         b_elapsed_cap=B_ELAPSED_CAP, b_min_peers=B_MIN_PEERS,
         b_alpha=B_ALPHA, b_min_count=B_MIN_COUNT, b_min_oe=B_MIN_OE,
         c_base_len=C_BASE_LEN, c_alpha=C_ALPHA, c_min_count=C_MIN_COUNT,
+        c_min_oe=C_MIN_OE, c_min_excess=C_MIN_EXCESS,
+        c_exceed_hist=C_EXCEED_HIST, c_exclude=C_EXCLUDE,
         c_min_base_months=C_MIN_BASE_MONTHS, c_min_base_count=C_MIN_BASE_COUNT,
         multi_bonus=MULTI_BONUS, score_cap=SCORE_CAP, top_n=TOP_N,
         suppress_months=SUPPRESS_MONTHS,
         all_token=ALL_TOKEN,
         machine_all_part_token=MACHINE_ALL_PART_TOKEN,
-        use_horizon=USE_HORIZON,
-        horizon_margin_months=HORIZON_MARGIN_MONTHS,
-        horizon_margin_overrides=HORIZON_MARGIN_OVERRIDES,
-        horizon_fixed=HORIZON_FIXED,
-        horizon_auto_margin=HORIZON_AUTO_MARGIN,
-        horizon_thin_ratio=HORIZON_THIN_RATIO,
-        c_revisit_months=C_REVISIT_MONTHS,
-        b_truncate_to_horizon=B_TRUNCATE_TO_HORIZON,
     )
     return cfg
 
@@ -185,8 +163,7 @@ if __name__ == "__main__":
     cfg = build_cfg()
     print("=== 現在の設定 ===")
     for k in ("base_threshold_pct", "b_elapsed_cap", "b_min_peers", "b_alpha",
-              "c_base_len", "c_alpha", "c_min_count", "top_n",
-              "use_horizon", "c_revisit_months", "b_truncate_to_horizon"):
+              "c_base_len", "c_alpha", "c_min_count", "top_n"):
         print(f"  {k:22s} = {cfg[k]}")
     print(f"  suppress_months        = {cfg['suppress_months']}")
     print(f"  列名 sf                = {COLS['sf']}")
