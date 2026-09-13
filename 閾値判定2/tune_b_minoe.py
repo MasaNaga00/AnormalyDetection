@@ -37,43 +37,24 @@ def scan(panel_path: str, elapsed_cap: int | None = None) -> pd.DataFrame:
     """全 (機種, SF) の O/E と p を1回だけ計算する。"""
     cap = elapsed_cap if elapsed_cap is not None else st.B_ELAPSED_CAP
     raw = pd.read_csv(panel_path, encoding="utf-8-sig")
-    # 列名は settings.COLS を参照する（実データで触るのは settings.py だけ、の原則）
-    c_ym = st.COLS["ym"]
-    raw[c_ym] = raw[c_ym].astype(str).str.replace(r"\D", "", regex=True).astype(int)
-    # run_month.py と同じ前処理（累積販売台数の逆転を cummax で補正）
-    keys = [st.COLS["biz"], st.COLS["dev"], st.COLS["part"], st.COLS["dist"]]
-    raw = raw.sort_values(keys + [c_ym])
-    raw[st.COLS["cum_sales"]] = raw.groupby(keys)[st.COLS["cum_sales"]].cummax()
+    raw["年月"] = raw["年月"].astype(str).str.replace(r"\D", "", regex=True).astype(int)
     p_all = raw[raw[st.COLS["dist"]].astype(str) == st.ALL_TOKEN]
 
     cfg = dict(sc.CONFIG)
     cfg["cols"] = {**sc.CONFIG["cols"], **st.COLS}
     pb = sc._prepare_panel(p_all.copy(), cfg)
 
-    # 判定対象がどこで減ったかの内訳（実データで B_ELAPSED_CAP を決めるのに要る）
-    uf = sb.build_peer_units(pb, elapsed_cap=cap, require_full=False)
-    ur = sb.build_peer_units(pb, elapsed_cap=cap, require_full=True)
-    dropped = sorted(set(uf["dev"]) - set(ur["dev"]))
-
-    # min_oe=0, alpha=0.9999 で全件の O/E と p を残す。
-    # two_pass=False は意図的: 2パス目の「発火機種をピアから外す」判定は
-    # min_oe/alpha に依存するので、1回のスキャンで全操作点を表せない。
-    # → 操作点を選んだら confirm() で2パス（本番と同じ）を必ず確認すること。
+    # min_oe=0, alpha=0.9999 で全件の O/E と p を残す
     r = sb.run_signal_b(pb, elapsed_cap=cap, min_peers=st.B_MIN_PEERS,
                         alpha_peer=0.9999, min_count=st.B_MIN_COUNT,
                         min_oe=0.0, two_pass=False)
     r = r[r["p"].notna()].copy()
     r.to_csv("scan_b.csv", index=False, encoding="utf-8-sig")
-    print(f"機種×SF の組合せ: {len(uf)}  → require_full(cover>={cap}): {len(ur)}"
-          f"  → min_peers>={st.B_MIN_PEERS}: {len(r)} = 判定対象")
-    if dropped:
-        print(f"  require_full で落ちた機種: {dropped}（窓を完走していない若い機種）")
-    print(f"中央C={int(r['C'].median())}  → scan_b.csv に保存")
-    print(f"O/E の分布(1パス): "
+    print(f"判定対象 (機種×SF): {len(r)}  中央C={int(r['C'].median())}  "
+          f"→ scan_b.csv に保存")
+    print(f"O/E の分布: "
           f"中央={r['O_E'].median():.2f}  P90={r['O_E'].quantile(0.9):.2f}  "
           f"P95={r['O_E'].quantile(0.95):.2f}  最大={r['O_E'].max():.2f}")
-    print("  ※ 本番は2パスなので分布はこれより上にずれる（正常機種のO/Eが1.0へ是正される）。"
-          "\n     P95 から min_oe を決めるときは、confirm() で本番の値を確認すること。")
     return r
 
 
@@ -137,74 +118,6 @@ def top_list(s: pd.DataFrame, min_oe: float, alpha: float, n: int = 30):
     return hit
 
 
-def confirm(panel_path: str, min_oe: float, alpha: float,
-            elapsed_cap: int | None = None) -> pd.DataFrame:
-    """選んだ操作点を**本番と同じ2パス**で再計算して、実際に何が発火するか確認する。
-
-    scan() は 1パス（two_pass=False）なので、scan_b.csv の O/E は本番の値と
-    わずかにずれる。2パス目で「発火した機種をピアプールから外す」と、
-    同じ群の正常機種の O/E が 1.0 へ是正され、分布全体が上にずれるため。
-    同一SF群に複数の異常があると、本番の方が多く発火することがある。
-    """
-    cap = elapsed_cap if elapsed_cap is not None else st.B_ELAPSED_CAP
-    raw = pd.read_csv(panel_path, encoding="utf-8-sig")
-    c_ym = st.COLS["ym"]
-    raw[c_ym] = raw[c_ym].astype(str).str.replace(r"\D", "", regex=True).astype(int)
-    p_all = raw[raw[st.COLS["dist"]].astype(str) == st.ALL_TOKEN]
-    cfg = dict(sc.CONFIG)
-    cfg["cols"] = {**sc.CONFIG["cols"], **st.COLS}
-    pb = sc._prepare_panel(p_all.copy(), cfg)
-
-    r = sb.run_signal_b(pb, elapsed_cap=cap, min_peers=st.B_MIN_PEERS,
-                        alpha_peer=alpha, min_count=st.B_MIN_COUNT,
-                        min_oe=min_oe, two_pass=True)
-    a = r[r["alert_peer"]]
-    print(f"\n=== 本番(2パス) min_oe={min_oe}, alpha={alpha} → 発火 {len(a)}件 ===")
-    print(f"O/E の分布(2パス): 中央={r['O_E'].median():.2f}  "
-          f"P90={r['O_E'].quantile(0.9):.2f}  P95={r['O_E'].quantile(0.95):.2f}")
-    if len(a):
-        print(a[["dev", "sf", "nb", "n_peers", "C", "O_E", "p", "注目度"]]
-              .to_string(index=False))
-    else:
-        print("  （発火なし）")
-    return a
-
-
-def nb_profile(panel_path: str, sf: str | None = None,
-               elapsed_cap: int | None = None) -> pd.DataFrame:
-    """SF群ごとの nb 構成を見る。nb層別でピアが足りず沈黙する群を特定する。
-
-    「幅0」（全機種のnbが同じ）の群は信号Bがそのまま効く。
-    nb がばらつく群は nb ごとに割れるので、単独nbの機種は判定対象から外れる。
-    """
-    cap = elapsed_cap if elapsed_cap is not None else st.B_ELAPSED_CAP
-    raw = pd.read_csv(panel_path, encoding="utf-8-sig")
-    c_ym = st.COLS["ym"]
-    raw[c_ym] = raw[c_ym].astype(str).str.replace(r"\D", "", regex=True).astype(int)
-    p_all = raw[raw[st.COLS["dist"]].astype(str) == st.ALL_TOKEN]
-    cfg = dict(sc.CONFIG)
-    cfg["cols"] = {**sc.CONFIG["cols"], **st.COLS}
-    pb = sc._prepare_panel(p_all.copy(), cfg)
-    u = sb.build_peer_units(pb, elapsed_cap=cap, require_full=True)
-    if sf is not None:
-        print(f"\n=== {sf} の nb 構成 ===")
-        print(u[u["sf"] == sf][["dev", "nb", "C", "E"]]
-              .sort_values("nb").to_string(index=False))
-        return u[u["sf"] == sf]
-    g = u.groupby(["biz", "sf"]).agg(
-        機種数=("dev", "nunique"), nb最小=("nb", "min"), nb最大=("nb", "max"))
-    g["幅"] = g["nb最大"] - g["nb最小"]
-    # nb ごとの機種数が min_peers+1 未満なら、その nb の機種は沈黙する
-    cnt = u.groupby(["biz", "sf", "nb"])["dev"].nunique().rename("同nb機種数")
-    lonely = cnt[cnt < st.B_MIN_PEERS + 1].reset_index()
-    print("\n=== SF群の nb 構成 ===")
-    print(g.sort_values("幅", ascending=False).to_string())
-    if len(lonely):
-        print(f"\n=== ピア不足で沈黙する (SF, nb) : {len(lonely)}件 ===")
-        print(lonely.to_string(index=False))
-    return g
-
-
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print(__doc__)
@@ -213,9 +126,41 @@ if __name__ == "__main__":
     sweep(s)
     if len(sys.argv) > 2:
         check_labels(s, sys.argv[2])
-    print("\n--- 次にやること ---")
-    print("  import pandas as pd, tune_b_minoe as tb")
-    print("  s = pd.read_csv('scan_b.csv', encoding='utf-8-sig')")
-    print("  tb.top_list(s, min_oe=2.0, alpha=0.005)   # 境界に何が来るかを目視")
-    print(f"  tb.confirm('{sys.argv[1]}', min_oe=2.0, alpha=0.005)  # 本番(2パス)で確認")
-    print(f"  tb.nb_profile('{sys.argv[1]}')            # 沈黙する群の特定")
+
+
+def oe_by_count(s: pd.DataFrame) -> pd.DataFrame:
+    """件数帯別の O/E 分布。**件数下限を決めるための主要な表。**
+
+    薄い単位は異常がなくても O/E が跳ねる。件数帯ごとの O/E の上側
+    （P95・最大）を見て、ノイズで到達しうる水準を実データで確かめる。
+    """
+    d = s.copy()
+    d["件数帯"] = pd.cut(d["C"], [0, 5, 10, 20, 50, 100, 1e9],
+                      labels=["〜5", "6-10", "11-20", "21-50", "51-100", "100〜"])
+    t = d.groupby("件数帯", observed=True).agg(
+        単位数=("O_E", "size"), O_E中央=("O_E", "median"),
+        P90=("O_E", lambda x: x.quantile(0.9)),
+        P95=("O_E", lambda x: x.quantile(0.95)),
+        最大=("O_E", "max"))
+    print("\n=== 件数帯別の O/E 分布 ===")
+    print("  薄い帯の P95・最大が大きいほど、その帯はノイズで上位に来る")
+    print("  → その帯が消える件数を B_MIN_COUNT にする")
+    print(t.round(2).to_string())
+    return t
+
+
+def count_floor_sweep(s: pd.DataFrame, floors=(3, 10, 20, 30, 50),
+                      min_oe: float = 1.5, alpha: float = 0.005) -> pd.DataFrame:
+    """件数下限を振って、発火件数と最小件数がどう動くかを見る。"""
+    rows = []
+    for mc in floors:
+        hit = s[(s["C"] >= mc) & (s.get("C_peer", s["C"]) >= mc)
+                & (s["O_E"] >= min_oe) & (s["p"] <= alpha)]
+        rows.append(dict(下限=mc, 判定対象=int(((s["C"] >= mc)).sum()),
+                         発火数=len(hit),
+                         発火の最小件数=int(hit["C"].min()) if len(hit) else None,
+                         発火の最大O_E=round(hit["O_E"].max(), 2) if len(hit) else None))
+    t = pd.DataFrame(rows)
+    print(f"\n=== 件数下限スイープ（min_oe={min_oe}, alpha={alpha}）===")
+    print(t.to_string(index=False))
+    return t

@@ -58,7 +58,13 @@ B_MIN_PEERS = 2        # ピア機種がこの数以上そろって初めて判�
 B_MIN_OE = 1.5
 
 B_ALPHA = 0.005        # 補助レバー。件数の少ない群での偶然を落とすガード
-B_MIN_COUNT = 3        # この使用数未満は発火させない
+
+# ★件数の下限（対象側・ピア側）。薄い単位はノイズだけでO/Eが跳ねる
+#   （1機種10件規模だと、異常がなくてもO/E=2.9が出る）。
+#   注目度はO/Eベースなので、放置すると薄い単位が上位を占拠する。
+#   目安: 20以上。実データのO/E分布を件数帯別に見てから決める。
+B_MIN_COUNT = 20       # 対象機種の累積件数
+B_MIN_PEER_COUNT = 20  # ピアプール合計の累積件数
 B_NB_STRAT = True      # nb(部番数)が一致する機種同士だけ比較。原則 True のまま
 B_TWO_PASS = True      # 発火機種をピアプールから外して再計算。原則 True のまま
 
@@ -146,7 +152,8 @@ def build_cfg() -> dict:
         margin_pct=MARGIN_PCT,
         min_denominator=MIN_DENOMINATOR,
         b_elapsed_cap=B_ELAPSED_CAP, b_min_peers=B_MIN_PEERS,
-        b_alpha=B_ALPHA, b_min_count=B_MIN_COUNT, b_min_oe=B_MIN_OE,
+        b_alpha=B_ALPHA, b_min_count=B_MIN_COUNT,
+        b_min_peer_count=B_MIN_PEER_COUNT, b_min_oe=B_MIN_OE,
         c_base_len=C_BASE_LEN, c_alpha=C_ALPHA, c_min_count=C_MIN_COUNT,
         c_min_oe=C_MIN_OE, c_min_excess=C_MIN_EXCESS,
         c_exceed_hist=C_EXCEED_HIST, c_exclude=C_EXCLUDE,

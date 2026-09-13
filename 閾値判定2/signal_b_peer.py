@@ -127,12 +127,18 @@ def _peer_compare(u: pd.DataFrame, key: list, min_peers: int,
 
 
 def run_signal_b(panel: pd.DataFrame, elapsed_cap: int = 36, min_peers: int = 2,
-                 alpha_peer: float = 0.005, min_count: int = 3, min_oe: float = 1.5,
+                 alpha_peer: float = 0.005, min_count: int = 20,
+                 min_peer_count: int = 20, min_oe: float = 1.5,
                  nb_strat: bool = True, require_full: bool = True,
                  two_pass: bool = True) -> pd.DataFrame:
     """信号Bの本体。全 (機種, biz, SF) について、同群のピアと比較した結果を返す。
 
     min_peers : ピア機種が何台以上そろっていれば判定するか（未満は監視不能＝沈黙）
+    min_count : **対象機種の累積件数の下限。** 件数が少ないと純粋なノイズでも
+                O/E が跳ねる（10件規模だとノイズだけで O/E=2.9 に達する）。
+                注目度は O/E ベースなので、薄い単位が上位を占拠してしまう。
+    min_peer_count : **ピアプール側の累積件数の下限。** 分母が薄いと期待値の
+                推定が不安定になり、同じくO/Eが暴れる。対象と同水準にしておく。
     min_oe    : **主レバー**。ピア比がこの倍率以上のときだけ発火させる。
                 件数Cが数百になるとp値は桁で吹き飛び、O/E=1.2 でも p<1e-3 になる。
                 機種は正当な理由（設計世代・市場構成）でも差が出る＝過分散があるので、
@@ -151,7 +157,8 @@ def run_signal_b(panel: pd.DataFrame, elapsed_cap: int = 36, min_peers: int = 2,
         return u
 
     if two_pass:
-        bad = (u["p"] <= alpha_peer) & (u["C"] >= min_count) & (u["O_E"] >= min_oe)
+        bad = ((u["p"] <= alpha_peer) & (u["C"] >= min_count)
+               & (u["C_peer"] >= min_peer_count) & (u["O_E"] >= min_oe))
         if bad.any():
             flag = u0.merge(u.loc[bad, ["biz", "sf", "dev"]].assign(_x=True),
                             on=["biz", "sf", "dev"], how="left")["_x"].fillna(False)
@@ -163,7 +170,7 @@ def run_signal_b(panel: pd.DataFrame, elapsed_cap: int = 36, min_peers: int = 2,
                 u = pd.concat([u[keep.to_numpy()], u2], ignore_index=True)
 
     u["alert_peer"] = ((u["p"] <= alpha_peer) & (u["C"] >= min_count)
-                       & (u["O_E"] >= min_oe))
+                       & (u["C_peer"] >= min_peer_count) & (u["O_E"] >= min_oe))
 
     # 注目度は O/E ベース（p値は桁が飛びすぎて並び順の物差しにならない）。
     # min_oe で1.0、min_oe の3倍で上限3.0 になる線形スケール。
@@ -172,7 +179,7 @@ def run_signal_b(panel: pd.DataFrame, elapsed_cap: int = 36, min_peers: int = 2,
         np.minimum(1.0 + 2.0 * (u["O_E"] - min_oe) / max(2.0 * min_oe, 1e-9), 3.0),
         0.0).round(3)
 
-    cols = ["biz", "sf", "dev", "nb", "n_peers", "C", "E", "expected",
+    cols = ["biz", "sf", "dev", "nb", "n_peers", "C", "C_peer", "E", "expected",
             "O_E", "p", "peer_rate", "alert_peer", "注目度", "cover"]
     out = u[cols].sort_values(["alert_peer", "注目度"], ascending=[False, False])
     return out.reset_index(drop=True)

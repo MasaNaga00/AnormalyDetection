@@ -58,7 +58,7 @@ CONFIG = {
     "min_denominator": 0,
     # 信号B
     "b_elapsed_cap": 36, "b_min_peers": 2, "b_alpha": 0.005, "b_min_count": 3,
-    "b_min_oe": 1.5,
+    "b_min_oe": 1.5, "b_min_peer_count": 20,
     # 信号C
     "c_base_len": 12, "c_alpha": 0.005, "c_min_count": 3,
     "c_min_oe": 3.0, "c_min_excess": 0.0,
@@ -343,6 +343,7 @@ def build_unified_inbox(panel_all: pd.DataFrame, panel_dist: pd.DataFrame,
     res_b = sb.run_signal_b(p_b, elapsed_cap=cfg["b_elapsed_cap"],
                             min_peers=cfg["b_min_peers"], alpha_peer=cfg["b_alpha"],
                             min_count=cfg["b_min_count"],
+                            min_peer_count=cfg.get("b_min_peer_count", 20),
                             min_oe=cfg.get("b_min_oe", 1.5))
 
     # --- 信号C ---
