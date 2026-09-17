@@ -65,6 +65,12 @@ B_ALPHA = 0.005        # 補助レバー。件数の少ない群での偶然を�
 #   目安: 20以上。実データのO/E分布を件数帯別に見てから決める。
 B_MIN_COUNT = 20       # 対象機種の累積件数
 B_MIN_PEER_COUNT = 20  # ピアプール合計の累積件数
+# 信号Bの判定単位は「機種×SF」なので、レビュー用に部番へ展開する必要がある。
+# その際、SF内でこのシェア未満の部番は出さない（端数は指標欄に併記）。
+# 実データの内訳は「主役 + 1%未満の端数」か「7:3の分担」に割れていたため、
+# その間にある 0.1 なら両方を正しく扱える。
+B_EXPAND_MIN_SHARE = 0.1
+
 B_NB_STRAT = True      # nb(部番数)が一致する機種同士だけ比較。原則 True のまま
 B_TWO_PASS = True      # 発火機種をピアプールから外して再計算。原則 True のまま
 
@@ -154,6 +160,7 @@ def build_cfg() -> dict:
         b_elapsed_cap=B_ELAPSED_CAP, b_min_peers=B_MIN_PEERS,
         b_alpha=B_ALPHA, b_min_count=B_MIN_COUNT,
         b_min_peer_count=B_MIN_PEER_COUNT, b_min_oe=B_MIN_OE,
+        b_expand_min_share=B_EXPAND_MIN_SHARE,
         c_base_len=C_BASE_LEN, c_alpha=C_ALPHA, c_min_count=C_MIN_COUNT,
         c_min_oe=C_MIN_OE, c_min_excess=C_MIN_EXCESS,
         c_exceed_hist=C_EXCEED_HIST, c_exclude=C_EXCLUDE,

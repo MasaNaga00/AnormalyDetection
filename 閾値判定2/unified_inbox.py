@@ -58,7 +58,7 @@ CONFIG = {
     "min_denominator": 0,
     # 信号B
     "b_elapsed_cap": 36, "b_min_peers": 2, "b_alpha": 0.005, "b_min_count": 3,
-    "b_min_oe": 1.5, "b_min_peer_count": 20,
+    "b_min_oe": 1.5, "b_min_peer_count": 20, "b_expand_min_share": 0.1,
     # 信号C
     "c_base_len": 12, "c_alpha": 0.005, "c_min_count": 3,
     "c_min_oe": 3.0, "c_min_excess": 0.0,
@@ -226,14 +226,32 @@ def candidates_signal_b(res_b: pd.DataFrame, panel_b: pd.DataFrame,
     pu = (d.groupby(["biz", "dev", "sf", "part"], as_index=False)["use"].sum()
             .rename(columns={"use": "部番使用数"}))
     m = a.merge(pu, on=["biz", "dev", "sf"], how="left")
-    m = m[m["部番使用数"].fillna(0) > 0]      # 実績のある部番だけに展開
+    m = m[m["部番使用数"].fillna(0) > 0]
+
+    # SF内でのシェア。判定はSF単位なので、件数のごく少ない部番まで展開すると
+    # 累積1件の部番がレビューに並ぶ。主役だけ出し、端数は指標欄に併記する。
+    tot = m.groupby(["biz", "dev", "sf"])["部番使用数"].transform("sum")
+    m["シェア"] = m["部番使用数"] / tot.replace(0, np.nan)
+    thr = cfg.get("b_expand_min_share", 0.1)
+    keep = m["シェア"] >= thr
+    # どのSFでも最低1部番は残す（全部が閾値未満なら最大のものを採用）
+    top = m.groupby(["biz", "dev", "sf"])["部番使用数"].transform("max")
+    keep = keep | (m["部番使用数"] == top)
+    drop = m[~keep].groupby(["biz", "dev", "sf"]).agg(
+        他部番数=("part", "size"), 他件数=("部番使用数", "sum"))
 
     rows = []
-    for r in m.itertuples():
+    for r in m[keep].itertuples():
+        k = (r.biz, r.dev, r.sf)
+        extra = ""
+        if k in drop.index:
+            e = drop.loc[k]
+            extra = f" ＋他{int(e.他部番数)}部番({int(e.他件数)}件)"
         rows.append(dict(事業コード=r.biz, 開発コード=r.dev, 部番=r.part,
                          対象販社="", 検出器="信号B", 判定年月=lv.T,
                          指標=(f"SF={r.sf} O/E={r.O_E:.2f} "
-                             f"(ピア{r.n_peers}機種, nb={r.nb}, 部番{int(r.部番使用数)}件)"),
+                             f"(ピア{r.n_peers}機種, nb={r.nb}, "
+                             f"部番{int(r.部番使用数)}件/{r.シェア*100:.0f}%{extra})"),
                          比=r.O_E, 生スコア=float(r.注目度),
                          観測率=np.nan, 当月閾値=np.nan, 提案Y下限=np.nan))
     return pd.DataFrame(rows)
