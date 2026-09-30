@@ -25,6 +25,8 @@ import sys
 import numpy as np
 import pandas as pd
 
+import config_loader as cl
+cl.activate_from_argv()          # --cat X でカテゴリ設定に切り替え
 import settings as st
 
 COLS = st.COLS
@@ -210,7 +212,7 @@ def main(path: str):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
+    if len(sys.argv) < 2 and not cl.category():
         print(__doc__)
         sys.exit(1)
-    main(sys.argv[1])
+    main(cl.panel_arg(sys.argv[1:], 0))

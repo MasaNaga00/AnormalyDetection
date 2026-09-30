@@ -141,8 +141,19 @@ def run_signal_c(panel: pd.DataFrame, cols: dict, base_len: int = 12,
                  min_oe: float = 3.0, min_excess: float = 0.0,
                  exceed_hist: float = 0.0, exclude: set | None = None,
                  asof_ym: int | None = None, months_back: int = 0,
-                 all_token: str = ALL_TOKEN) -> pd.DataFrame:
+                 all_token: str = ALL_TOKEN,
+                 horizon: dict | None = None,
+                 revisit_months: int = 0) -> pd.DataFrame:
     """信号Cの本体。
+
+    horizon         : {販社: 完全と見なせる最終年月}（reporting_horizon.estimate_horizon）。
+                      販社ごとに、これより後の月を系列から切り落としてから検定する
+                      （未確定月を判定・ベースラインに入れない）。None なら切らない。
+    revisit_months  : 基準月Tから何ヶ月さかのぼって毎回再判定するか。
+                      **販社の最大遅れ月数以上**にする。足りないと遅れている販社の月が
+                      永久に一度も検定されない。
+                      horizon=None, revisit_months=0 なら従来と完全に同じ挙動になる。
+                      出力の run_ym は基準月T、遅延月は T - ym（>0 なら遅れて届いた月）。
 
     asof_ym     : 判定基準月。None ならパネル最新月。
     months_back : 0 なら基準月のみ判定（本番運用）。>0 なら過去にさかのぼって
@@ -169,6 +180,13 @@ def run_signal_c(panel: pd.DataFrame, cols: dict, base_len: int = 12,
     if d.empty:
         return d
     T = int(asof_ym) if asof_ym is not None else int(d["ym"].max())
+    if horizon:
+        # 販社ごとに horizon より後ろ（未確定月）を切り落とす
+        hz = d["dist"].astype(str).map({str(k): int(v) for k, v in horizon.items()})
+        d = d[hz.isna() | (d["ym"] <= hz.fillna(0))]
+        if d.empty:
+            return d
+    lo = _shift_ym(T, -(int(months_back) + int(revisit_months)))
 
     rows = []
     for (biz, dev, part, dist), g in d.groupby(["biz", "dev", "part", "dist"], sort=False):
@@ -182,13 +200,14 @@ def run_signal_c(panel: pd.DataFrame, cols: dict, base_len: int = 12,
                                       min_base_months, min_base_count,
                                       min_oe, min_excess, exceed_hist)
         ym = g["ym"].to_numpy()
-        sel = np.flatnonzero((ym <= T) & (ym >= _shift_ym(T, -months_back)))
+        sel = np.flatnonzero((ym <= T) & (ym >= lo))
         for t in sel:
             rows.append(dict(
                 biz=biz, dev=dev, part=part, dist=dist, ym=int(ym[t]),
                 use=use[t], fleet=fleet[t], base_rate=br[t],
                 expected=br[t] * fleet[t] if not np.isnan(br[t]) else np.nan,
                 O_E=oe[t], p=p[t], alert_dist=bool(al[t]),
+                run_ym=T, 遅延月=_diff_ym(T, int(ym[t])),
             ))
     out = pd.DataFrame(rows)
     if out.empty:
@@ -206,6 +225,13 @@ def _shift_ym(ym: int, k: int) -> int:
     y, m = divmod(int(ym), 100)
     idx = y * 12 + (m - 1) + k
     return (idx // 12) * 100 + (idx % 12) + 1
+
+
+def _diff_ym(a: int, b: int) -> int:
+    """a - b を月数で返す。"""
+    ya, ma = divmod(int(a), 100)
+    yb, mb = divmod(int(b), 100)
+    return (ya * 12 + ma) - (yb * 12 + mb)
 
 
 def summarize_by_unit(res: pd.DataFrame) -> pd.DataFrame:

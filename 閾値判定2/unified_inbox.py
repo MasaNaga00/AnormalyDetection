@@ -40,6 +40,7 @@ import state_logic as sl
 import state_logic_cusum as sc
 import signal_b_peer as sb
 import signal_c_dist as sd
+import reporting_horizon as rh
 
 DETECTORS = ("閾値", "信号B", "信号C", "CUSUM")
 
@@ -74,6 +75,14 @@ CONFIG = {
     "top_n": 15,
     "all_token": "ALL",
     "machine_all_part_token": "機種全体",
+    # 販社の報告遅れ（reporting_horizon.py）。use_horizon=False なら
+    # horizon・再評価窓・信号Bの打ち切りがすべて無効＝遅延対応前と同一挙動。
+    "use_horizon": False,
+    "horizon_margin_months": 0, "horizon_auto_margin": True,
+    "horizon_thin_ratio": 0.7, "horizon_margin_overrides": {},
+    "horizon_fixed": {},
+    "c_revisit_months": 6,
+    "b_truncate_to_horizon": True,
 }
 
 
@@ -117,8 +126,13 @@ class LedgerView:
             g = g.sort_values(["判定年月", "記録日"], na_position="first")
             self.last[key] = g
 
-    def status(self, biz, dev, part, detector: str | None = None) -> dict:
+    def status(self, biz, dev, part, detector: str | None = None,
+               event_ym: int | None = None) -> dict:
         """月Tの時点で、この部品を(指定の検出器で)出すべきかを解決する。
+
+        event_ym: 発火した対象月。None なら T。信号Cの再評価窓では過去月が
+        毎回再判定されるため、抑制は **run月Tでなく発火月** で判定する
+        （run月で判定すると、記録済みの過去月が抑制期間明けに再登場する）。
 
         detector=None なら「どの検出器でも共通の判定」（終了・保留）だけを見る。
         検出器名を渡すと、その検出器に対する抑制まで含めて判定する。
@@ -164,7 +178,8 @@ class LedgerView:
         else:
             n = self.cfg["suppress_months"].get(detector, 1)
             until = sc._add_months(M, int(n))      # 空欄なら検出器ごとの既定
-        return dict(state="監視中", thr_ov=thr_ov, suppressed=(self.T < until),
+        e = self.T if event_ym is None or pd.isna(event_ym) else int(event_ym)
+        return dict(state="監視中", thr_ov=thr_ov, suppressed=(e < until),
                     carry=False, until=until)
 
     @staticmethod
@@ -272,23 +287,47 @@ def expand_signal_b_to_parts(res_b: pd.DataFrame, panel: pd.DataFrame,
 
 
 def candidates_signal_c(res_c: pd.DataFrame, lv: LedgerView, cfg: dict) -> pd.DataFrame:
+    """信号Cの発火を部品単位にまとめる。
+
+    再評価窓（c_revisit_months）があると、遅れて届いた過去月も発火しうる。
+    台帳の抑制は**発火月ごと**に先に当ててから部品単位に畳む。
+    判定年月 = 最も古い発火月（台帳にはこれを書く。run月にすると次回runで
+    「判定年月 > 発火月」となり抑制が効かず二重に出る）。
+    """
     if res_c is None or res_c.empty:
         return pd.DataFrame()
-    a = res_c[(res_c["alert_dist"]) & (res_c["ym"] == lv.T)]
+    a = res_c[(res_c["alert_dist"]) & (res_c["ym"] <= lv.T)]
     if a.empty:
         return pd.DataFrame()
-    g = a.groupby(["biz", "dev", "part"], as_index=False).agg(
-        販社=("dist", lambda s: "/".join(sorted(set(s)))),
-        O_E=("O_E", "max"), p=("p", "min"), 注目度=("注目度", "max"),
-        use=("use", "sum"))
+    keep = []
+    for r in a.itertuples():
+        st = lv.status(r.biz, r.dev, r.part, "信号C", event_ym=int(r.ym))
+        keep.append(not st["suppressed"] or st["carry"])
+    a = a[np.array(keep)]
+    if a.empty:
+        return pd.DataFrame()
+
     rows = []
-    for r in g.itertuples():
-        rows.append(dict(事業コード=r.biz, 開発コード=r.dev, 部番=r.part,
-                         対象販社=r.販社, 検出器="信号C", 判定年月=lv.T,
-                         指標=f"O/E={r.O_E:.2f} 使用{int(r.use)}件 p={r.p:.1e}",
-                         比=r.O_E, 生スコア=float(r.注目度),
+    for (biz, dev, part), g in a.groupby(["biz", "dev", "part"]):
+        months = sorted(set(int(x) for x in g["ym"]))
+        m0 = months[0]
+        lag = sc_diff(lv.T, m0)
+        o = g.loc[g["注目度"].idxmax()]
+        tag = f"[{m0}の月・{lag}ヶ月遅れ] " if lag > 0 else ""
+        rows.append(dict(事業コード=biz, 開発コード=dev, 部番=part,
+                         対象販社="/".join(sorted(set(g["dist"].astype(str)))),
+                         検出器="信号C", 判定年月=m0,
+                         対象月内訳="/".join(str(m) for m in months),
+                         遅延月=lag,
+                         指標=(f"{tag}O/E={g['O_E'].max():.2f} "
+                             f"使用{int(g['use'].sum())}件 p={g['p'].min():.1e}"),
+                         比=float(g["O_E"].max()), 生スコア=float(o["注目度"]),
                          観測率=np.nan, 当月閾値=np.nan, 提案Y下限=np.nan))
     return pd.DataFrame(rows)
+
+
+def sc_diff(a: int, b: int) -> int:
+    return sd._diff_ym(a, b)
 
 
 # ============================================================================
@@ -301,9 +340,16 @@ def merge_candidates(parts: list[pd.DataFrame], lv: LedgerView, cfg: dict) -> pd
     c = pd.concat(parts, ignore_index=True)
 
     # 台帳による抑制（信号B/Cはここで初めて適用）
+    for col, default in (("対象月内訳", ""), ("遅延月", 0)):
+        if col not in c.columns:
+            c[col] = default
+    c["対象月内訳"] = [x if isinstance(x, str) and x else str(int(m))
+                    for x, m in zip(c["対象月内訳"].fillna(""), c["判定年月"])]
+    c["遅延月"] = pd.to_numeric(c["遅延月"], errors="coerce").fillna(0).astype(int)
     keep = []
     for r in c.itertuples():
-        st = lv.status(r.事業コード, r.開発コード, r.部番, r.検出器)
+        st = lv.status(r.事業コード, r.開発コード, r.部番, r.検出器,
+                       event_ym=int(r.判定年月))
         keep.append(not st["suppressed"] or st["carry"])
     c = c[np.array(keep)].reset_index(drop=True)
     if c.empty:
@@ -316,9 +362,12 @@ def merge_candidates(parts: list[pd.DataFrame], lv: LedgerView, cfg: dict) -> pd
         対象販社=("対象販社", lambda s: "/".join(sorted({x for x in s if x}))),
         指標=("指標", lambda s: " ｜ ".join(s)),
         最大スコア=("生スコア", "max"),
-        判定年月=("判定年月", "max"),
+        判定年月=("判定年月", "min"),   # 最も古い発火月（台帳にはこれを書く）
+        対象月内訳=("対象月内訳", lambda s: "/".join(
+            sorted({m for x in s for m in str(x).split("/") if m}))),
         観測率=("観測率", "max"), 当月閾値=("当月閾値", "max"),
-        提案Y下限=("提案Y下限", "max"))
+        提案Y下限=("提案Y下限", "max"),
+        遅延月=("遅延月", "max"))
 
     g["統合注目度"] = (g["最大スコア"]
                    + cfg["multi_bonus"] * (g["検出器数"] - 1)).round(3)
@@ -326,6 +375,7 @@ def merge_candidates(parts: list[pd.DataFrame], lv: LedgerView, cfg: dict) -> pd
                for r in g.itertuples()]
     g["抑制解除月"] = [lv.status(r.事業コード, r.開発コード, r.部番,
                             r.検出器.split("/")[0])["until"] for r in g.itertuples()]
+    g["run年月"] = lv.T
     g["処置区分"] = ""
     g["再評価年月"] = ""
     g["原因メモ"] = ""
@@ -340,7 +390,11 @@ def build_unified_inbox(panel_all: pd.DataFrame, panel_dist: pd.DataFrame,
 
     panel_all  : ALL行のみのパネル（生の列名）。閾値・信号Bで使う
     panel_dist : 販社別行のパネル（生の列名）。信号Cで使う
-    Returns: dict(inbox, top, b_raw, c_raw, b_parts)
+    Returns: dict(inbox, top, b_raw, c_raw, b_parts, rates, asof,
+                  horizon, horizon_report, completeness)
+
+    cfg["use_horizon"] が真のマスタースイッチ。False なら horizon・再評価窓・
+    信号Bの打ち切りはすべて無効（遅延対応前と同一挙動）。
     """
     # --- 閾値用の率テーブル ---
     sl_cfg = dict(sl.CONFIG)
@@ -354,10 +408,34 @@ def build_unified_inbox(panel_all: pd.DataFrame, panel_dist: pd.DataFrame,
     T = int(asof_ym) if asof_ym is not None else int(rates["ym"].max())
     lv = LedgerView(ledger, T, cfg)
 
+    # --- 販社の報告遅れ（horizon）---
+    hz, hz_global, hz_report, completeness = None, None, None, None
+    revisit = 0
+    if cfg.get("use_horizon", False):
+        ymc = cols["ym"]
+        pd_T = panel_dist[panel_dist[ymc].map(sd._to_ym) <= T]
+        hkw = dict(all_token=cfg["all_token"],
+                   margin_months=cfg.get("horizon_margin_months", 0),
+                   margin_overrides=cfg.get("horizon_margin_overrides") or {},
+                   fixed=cfg.get("horizon_fixed") or {},
+                   auto_margin=cfg.get("horizon_auto_margin", True),
+                   thin_ratio=cfg.get("horizon_thin_ratio", 0.7))
+        hz = rh.estimate_horizon(pd_T, cols, **hkw)
+        hz_global = rh.global_horizon(hz)
+        revisit = int(cfg.get("c_revisit_months", 0))
+        hz_report = rh.report(pd_T, cols, revisit_months=revisit, **hkw)
+        completeness = rh.missing_note(pd_T, cols, hz, T, all_token=cfg["all_token"])
+
     # --- 信号B用のパネル（CUSUM側の前処理を使う: elapsed/sf が要る）---
     sc_cfg = dict(sc.CONFIG)
     sc_cfg["cols"] = {**sc.CONFIG["cols"], **{k: v for k, v in cols.items()}}
     p_b = sc._prepare_panel(panel_all.copy(), sc_cfg)
+    # 判定基準月 T より後ろは使わない（asof_ym で過去を再現するとき未来のデータが
+    # 累積に混ざらないように。通常の月次実行では T=最新月なので何も落ちない）
+    p_b = p_b[p_b["ym"] <= T]
+    if hz_global is not None and cfg.get("b_truncate_to_horizon", True):
+        # 全販社が揃っている月で打ち切る（分子だけ欠けた月で機種間比較が歪むため）
+        p_b = p_b[p_b["ym"] <= min(T, hz_global)]
     res_b = sb.run_signal_b(p_b, elapsed_cap=cfg["b_elapsed_cap"],
                             min_peers=cfg["b_min_peers"], alpha_peer=cfg["b_alpha"],
                             min_count=cfg["b_min_count"],
@@ -373,7 +451,8 @@ def build_unified_inbox(panel_all: pd.DataFrame, panel_dist: pd.DataFrame,
                             min_excess=cfg.get("c_min_excess", 0.0),
                             exceed_hist=cfg.get("c_exceed_hist", 0.0),
                             exclude=cfg.get("c_exclude") or None,
-                            asof_ym=T, months_back=0, all_token=cfg["all_token"])
+                            asof_ym=T, months_back=0, all_token=cfg["all_token"],
+                            horizon=hz, revisit_months=revisit)
 
     cand = [candidates_threshold(rates, lv, cfg),
             candidates_signal_b(res_b, p_b, lv, cfg),
@@ -382,4 +461,6 @@ def build_unified_inbox(panel_all: pd.DataFrame, panel_dist: pd.DataFrame,
     return dict(inbox=inbox, top=inbox.head(cfg["top_n"]),
                 b_raw=res_b, c_raw=res_c,
                 b_parts=expand_signal_b_to_parts(res_b, p_b, cfg["b_elapsed_cap"]),
-                rates=rates, asof=T)
+                rates=rates, asof=T,
+                horizon=hz, horizon_global=hz_global,
+                horizon_report=hz_report, completeness=completeness)

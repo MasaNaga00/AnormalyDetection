@@ -31,6 +31,8 @@ import pandas as pd
 
 import signal_c_dist as sd
 
+import config_loader as cl
+cl.activate_from_argv()          # --cat X でカテゴリ設定に切り替え
 import settings as st
 
 COLS = st.COLS
@@ -43,13 +45,17 @@ LOOKBACK_M = 6          # ラベル評価: 報告月の何ヶ月前まで遡っ�
 
 
 # ============================================================================
-def step1_scan(panel_path: str, out: str = "scan_c.csv") -> pd.DataFrame:
-    """p値を1回だけ計算して保存する。ここが唯一の重い処理。"""
+def step1_scan(panel_path: str, out: str | None = None) -> pd.DataFrame:
+    """p値を1回だけ計算して保存する。ここが唯一の重い処理。
+
+    out=None なら cl.work_path("scan_c.csv")（カテゴリありなら 出力/<カテゴリ>/チューニング/）。
+    """
+    out = out or cl.work_path("scan_c.csv")
     raw = pd.read_csv(panel_path, encoding="utf-8-sig")
-    raw["年月"] = raw["年月"].astype(str).str.replace(r"\D", "", regex=True).astype(int)
-    dist = raw[raw[COLS["dist"]].astype(str) != "ALL"].copy()
+    raw[st.COLS["ym"]] = raw[st.COLS["ym"]].astype(str).str.replace(r"\D", "", regex=True).astype(int)
+    dist = raw[raw[COLS["dist"]].astype(str) != st.ALL_TOKEN].copy()
     print(f"販社別パネル: {len(dist)}行  "
-          f"系列数={dist.groupby(['事業コード','開発コード','部番','販社']).ngroups}")
+          f"系列数={dist.groupby([COLS[k] for k in ('biz','dev','part','dist')]).ngroups}")
 
     # alpha=1.0 で「全部発火扱い」にして p を残す。min_count は最小に。
     # スキャンでは足切りしない（min_oe=1.0 で上振れ全件、min_count は最小）
@@ -239,10 +245,10 @@ def missed_labels(scan: pd.DataFrame, labels_path: str, alpha: float,
 
 # ============================================================================
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
+    if len(sys.argv) < 2 and not cl.category():
         print(__doc__)
         sys.exit(1)
-    scan = step1_scan(sys.argv[1])
+    scan = step1_scan(cl.panel_arg(sys.argv[1:], 0))
     oe_by_baseline(scan)
     step2_oe(scan)
     tbl = step2_sweep(scan)

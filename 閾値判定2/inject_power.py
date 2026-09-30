@@ -27,6 +27,8 @@ import pandas as pd
 import signal_c_dist as sd
 import signal_b_peer as sb
 import state_logic_cusum as sc
+import config_loader as cl
+cl.activate_from_argv()          # --cat X でカテゴリ設定に切り替え
 import settings as st
 
 MULTS = [1.5, 2, 3, 5, 8, 12]
@@ -50,7 +52,7 @@ def power_c(panel_path: str, mults=MULTS, n_trial: int = N_TRIAL, seed: int = 0,
              base_len=st.C_BASE_LEN if base_len is None else base_len)
     rng = np.random.default_rng(seed)
     raw = pd.read_csv(panel_path, encoding="utf-8-sig")
-    raw["年月"] = raw["年月"].astype(str).str.replace(r"\D", "", regex=True).astype(int)
+    raw[st.COLS["ym"]] = raw[st.COLS["ym"]].astype(str).str.replace(r"\D", "", regex=True).astype(int)
     d = sd.prepare_dist_panel(raw[raw[st.COLS["dist"]] != st.ALL_TOKEN], st.COLS)
 
     # 判定に足る長さのある系列だけを母集団にする
@@ -97,7 +99,7 @@ def alerts_c(panel_path: str, months_back: int = 24, **over) -> float:
              min_excess=st.C_MIN_EXCESS, base_len=st.C_BASE_LEN)
     P.update({k: v for k, v in over.items() if v is not None})
     raw = pd.read_csv(panel_path, encoding="utf-8-sig")
-    raw["年月"] = raw["年月"].astype(str).str.replace(r"\D", "", regex=True).astype(int)
+    raw[st.COLS["ym"]] = raw[st.COLS["ym"]].astype(str).str.replace(r"\D", "", regex=True).astype(int)
     r = sd.run_signal_c(raw[raw[st.COLS["dist"]] != st.ALL_TOKEN], st.COLS,
                         base_len=P["base_len"], alpha=P["alpha"],
                         min_count=P["min_count"],
@@ -154,7 +156,7 @@ def power_b(panel_path: str, mults=MULTS, n_trial: int = N_TRIAL, seed: int = 0,
              elapsed_cap=st.B_ELAPSED_CAP if elapsed_cap is None else elapsed_cap)
     rng = np.random.default_rng(seed)
     raw = pd.read_csv(panel_path, encoding="utf-8-sig")
-    raw["年月"] = raw["年月"].astype(str).str.replace(r"\D", "", regex=True).astype(int)
+    raw[st.COLS["ym"]] = raw[st.COLS["ym"]].astype(str).str.replace(r"\D", "", regex=True).astype(int)
     p_all = raw[raw[st.COLS["dist"]].astype(str) == st.ALL_TOKEN]
 
     cfg = dict(sc.CONFIG); cfg["cols"] = {**sc.CONFIG["cols"], **st.COLS}
@@ -206,7 +208,7 @@ def alerts_b(panel_path: str, **over):
              elapsed_cap=st.B_ELAPSED_CAP)
     P.update({k: v for k, v in over.items() if v is not None})
     raw = pd.read_csv(panel_path, encoding="utf-8-sig")
-    raw["年月"] = raw["年月"].astype(str).str.replace(r"\D", "", regex=True).astype(int)
+    raw[st.COLS["ym"]] = raw[st.COLS["ym"]].astype(str).str.replace(r"\D", "", regex=True).astype(int)
     cfg = dict(sc.CONFIG); cfg["cols"] = {**sc.CONFIG["cols"], **st.COLS}
     pb = sc._prepare_panel(raw[raw[st.COLS["dist"]].astype(str) == st.ALL_TOKEN].copy(), cfg)
     r = sb.run_signal_b(pb, elapsed_cap=P["elapsed_cap"], min_peers=P["min_peers"],
@@ -244,9 +246,12 @@ def sweep_b(panel_path: str, param: str, values, mults=(1.5, 2, 3, 5),
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
+    a = sys.argv[1:]
+    if a and a[0].lower() in ("b", "c") and cl.category():   # --cat レンズ b
+        a = ["-"] + a
+    if not a and not cl.category():
         print(__doc__); sys.exit(1)
-    if len(sys.argv) > 2 and sys.argv[2].lower() == "b":
-        power_b(sys.argv[1])
+    if len(a) > 1 and a[1].lower() == "b":
+        power_b(cl.panel_arg(a, 0))
     else:
-        power_c(sys.argv[1])
+        power_c(cl.panel_arg(a, 0))

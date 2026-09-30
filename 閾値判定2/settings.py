@@ -33,6 +33,8 @@ BASE_THRESHOLD_PCT = 5.0
 # 部品ごとに基準を変えたいとき。{(事業コード, 開発コード, 部番): 閾値%}
 # 開発コードに None を入れると機種を問わず適用。
 #   例: {("E1", None, "P-1234"): 8.0}
+# 他に {("E1", "M02"): 6.0}（機種全体）、{("E1",): 4.0}（事業全体）も書ける。
+# 複数当たるときは (事業,機種,部番) > (事業,None,部番) > (事業,機種) > (事業,) の順で優先。
 THRESHOLD_OVERRIDES = {}
 
 # 「新常態受容」で上書き閾値を提案するときの上乗せ幅(%)
@@ -114,6 +116,48 @@ C_MIN_BASE_COUNT = 0.0 # ベースライン窓の最低使用数。0=制限な�
 
 
 # ============================================================================
+# 4.5 販社の報告遅れ（reporting_horizon.py）
+# ============================================================================
+# 販社ごとに修理データの送付頻度が違う（毎日／週次／月次）。3月上旬に集計すると
+# 月次送付の販社は12月分までしか入っていない、ということが起こる。
+#
+# ★ これを入れないと、遅れている販社の月は信号Cで**一度も検定されない**。
+#   run_signal_c は既定で基準月Tの1ヶ月だけを判定し、翌月もまたTしか見ないため。
+
+# マスタースイッチ。False にすると horizon・再評価窓・信号Bの打ち切り・
+# スナップショット保存がすべて無効になり、遅延対応前と完全に同じ挙動になる。
+USE_HORIZON = True
+
+# 各販社の末尾から落とす月数の既定値。0 のままでよい（下の自動判定が効く）。
+HORIZON_MARGIN_MONTHS = 0
+
+# True: 最終月の使用数計が直前6ヶ月の中央値の HORIZON_THIN_RATIO 未満なら
+#       「まだ月の途中」と見なして margin を +1 する。
+#       月次一括送付の販社は最終月が完結しているので margin 0、
+#       毎日/週次送付の販社は月の途中で切れて薄いので margin 1、が自動で付く。
+HORIZON_AUTO_MARGIN = True
+HORIZON_THIN_RATIO = 0.7
+
+# 送付実態が分かっている販社は手で固定できる（自動判定より優先）。
+#   例: HORIZON_MARGIN_OVERRIDES = {"日本": 0, "米国": 1}
+HORIZON_MARGIN_OVERRIDES = {}
+
+# 受領管理表がある場合はこれが正解。{販社: YYYYMM}
+HORIZON_FIXED = {}
+
+# ★信号Cが毎回さかのぼって再判定する月数。
+#   **販社の最大遅れ月数以上**にすること。足りないと月が永久に未検定になる。
+#   reporting_horizon.report(...) の「遅れ月数」の最大値を見て決める。
+#   迷ったら大きめ（6）にしてよい。既に台帳に記録済みの月は抑制で消える。
+C_REVISIT_MONTHS = 6
+
+# 信号Bを「全販社が揃っている月」で打ち切る。累積O/Eの機種間比較なので、
+# 直近の欠測量が機種の販社構成によって違うと比較が不公平になる。
+# 12ヶ月抑制の遅い検出器なので数ヶ月遅れても実害はない。
+B_TRUNCATE_TO_HORIZON = True
+
+
+# ============================================================================
 # 5. 統合インボックス
 # ============================================================================
 TOP_N = 15             # 毎月レビューする件数（人間の運用ルール）
@@ -134,6 +178,20 @@ OUT_ROOT = "出力"      # 生成物は 出力/YYYYMM/ 配下に置かれる
 
 
 # ============================================================================
+# 6.5 カテゴリ（categories/<名前>.py で上書きする項目）
+# ============================================================================
+# ここは空のままでよい。カテゴリごとの値は categories/ のファイルに書く。
+#   python run_month.py --cat レンズ   → categories/レンズ.py を読む
+# --cat を付けなければ従来どおり（出力は OUT_ROOT/YYYYMM/）。
+CATEGORY = ""          # カテゴリ名。空ならファイル名が使われる
+PANEL_PATH = None      # このカテゴリのパネルCSV（引数を省略したとき使う）
+LEDGER_PATH = None     # このカテゴリの台帳（引数を省略したとき使う）
+EXPECT_BIZ = None      # 想定する事業コードの集合。例: {"E1"}。
+                       # パネルにこれ以外が混ざっていたら run_month は停止する
+                       # （別カテゴリのファイルを渡した取り違えの検知）
+
+
+# ============================================================================
 # 7. 検証ツール用
 # ============================================================================
 LOOKBACK_M = 6         # 過去例の評価: 報告月の何ヶ月前まで遡って先行検知を認めるか
@@ -148,27 +206,41 @@ LABEL_COLS = dict(biz="事業コード", dev="開発コード", part="部番",
 # ============================================================================
 # 以下は組み立て。触らない。
 # ============================================================================
-def build_cfg() -> dict:
-    """unified_inbox に渡す設定を組み立てる。"""
+def build_cfg(ns=None) -> dict:
+    """unified_inbox に渡す設定を組み立てる。
+
+    ns: 値を読むモジュール（カテゴリ設定）。None ならこのファイル自身。
+    config_loader がカテゴリ設定の build_cfg をこれで差し替える。
+    """
+    g = globals() if ns is None else vars(ns)
     import unified_inbox as ui
     cfg = dict(ui.CONFIG)
     cfg.update(
-        base_threshold_pct=BASE_THRESHOLD_PCT,
-        threshold_overrides=THRESHOLD_OVERRIDES,
-        margin_pct=MARGIN_PCT,
-        min_denominator=MIN_DENOMINATOR,
-        b_elapsed_cap=B_ELAPSED_CAP, b_min_peers=B_MIN_PEERS,
-        b_alpha=B_ALPHA, b_min_count=B_MIN_COUNT,
-        b_min_peer_count=B_MIN_PEER_COUNT, b_min_oe=B_MIN_OE,
-        b_expand_min_share=B_EXPAND_MIN_SHARE,
-        c_base_len=C_BASE_LEN, c_alpha=C_ALPHA, c_min_count=C_MIN_COUNT,
-        c_min_oe=C_MIN_OE, c_min_excess=C_MIN_EXCESS,
-        c_exceed_hist=C_EXCEED_HIST, c_exclude=C_EXCLUDE,
-        c_min_base_months=C_MIN_BASE_MONTHS, c_min_base_count=C_MIN_BASE_COUNT,
-        multi_bonus=MULTI_BONUS, score_cap=SCORE_CAP, top_n=TOP_N,
-        suppress_months=SUPPRESS_MONTHS,
-        all_token=ALL_TOKEN,
-        machine_all_part_token=MACHINE_ALL_PART_TOKEN,
+        base_threshold_pct=g["BASE_THRESHOLD_PCT"],
+        threshold_overrides=g["THRESHOLD_OVERRIDES"],
+        margin_pct=g["MARGIN_PCT"],
+        min_denominator=g["MIN_DENOMINATOR"],
+        b_elapsed_cap=g["B_ELAPSED_CAP"], b_min_peers=g["B_MIN_PEERS"],
+        b_alpha=g["B_ALPHA"], b_min_count=g["B_MIN_COUNT"],
+        b_min_peer_count=g["B_MIN_PEER_COUNT"], b_min_oe=g["B_MIN_OE"],
+        b_expand_min_share=g["B_EXPAND_MIN_SHARE"],
+        c_base_len=g["C_BASE_LEN"], c_alpha=g["C_ALPHA"], c_min_count=g["C_MIN_COUNT"],
+        c_min_oe=g["C_MIN_OE"], c_min_excess=g["C_MIN_EXCESS"],
+        c_exceed_hist=g["C_EXCEED_HIST"], c_exclude=g["C_EXCLUDE"],
+        c_min_base_months=g["C_MIN_BASE_MONTHS"], c_min_base_count=g["C_MIN_BASE_COUNT"],
+        multi_bonus=g["MULTI_BONUS"], score_cap=g["SCORE_CAP"], top_n=g["TOP_N"],
+        suppress_months=g["SUPPRESS_MONTHS"],
+        all_token=g["ALL_TOKEN"],
+        category=g.get("CATEGORY", ""),
+        use_horizon=g["USE_HORIZON"],
+        horizon_margin_months=g["HORIZON_MARGIN_MONTHS"],
+        horizon_auto_margin=g["HORIZON_AUTO_MARGIN"],
+        horizon_thin_ratio=g["HORIZON_THIN_RATIO"],
+        horizon_margin_overrides=g["HORIZON_MARGIN_OVERRIDES"],
+        horizon_fixed=g["HORIZON_FIXED"],
+        c_revisit_months=g["C_REVISIT_MONTHS"],
+        b_truncate_to_horizon=g["B_TRUNCATE_TO_HORIZON"],
+        machine_all_part_token=g["MACHINE_ALL_PART_TOKEN"],
     )
     return cfg
 
@@ -180,5 +252,9 @@ if __name__ == "__main__":
               "c_base_len", "c_alpha", "c_min_count", "top_n"):
         print(f"  {k:22s} = {cfg[k]}")
     print(f"  suppress_months        = {cfg['suppress_months']}")
+    print(f"  use_horizon            = {cfg['use_horizon']}"
+          f"  (c_revisit_months={cfg['c_revisit_months']},"
+          f" b_truncate={cfg['b_truncate_to_horizon']})")
     print(f"  列名 sf                = {COLS['sf']}")
     print(f"  出力先                 = {OUT_ROOT}/")
+    print("  カテゴリ               = （なし。--cat で categories/ を指定）")

@@ -193,8 +193,12 @@ def unit_timelines(ledger, cfg):
 
 
 def base_threshold(cfg, biz, dev, part):
+    """部品の基準閾値X(%)。threshold_overrides のキーを具体的なものから順に探す。
+
+      (事業, 機種, 部番) > (事業, None, 部番)（機種を問わず） > (事業, 機種) > (事業,)
+    """
     ov = cfg["threshold_overrides"]
-    for k in ((biz, dev, part), (biz, dev), (biz,)):
+    for k in ((biz, dev, part), (biz, None, part), (biz, dev), (biz,)):
         if k in ov:
             return ov[k]
     return cfg["base_threshold_pct"]

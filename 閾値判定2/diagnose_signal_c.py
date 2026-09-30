@@ -23,6 +23,8 @@ import pandas as pd
 
 import reporting_horizon as rh
 import signal_c_dist as sd
+import config_loader as cl
+cl.activate_from_argv()          # --cat X でカテゴリ設定に切り替え
 import settings as st
 
 COLS = st.COLS
@@ -228,12 +230,12 @@ def trace(panel_path: str, dev: str, part: str, dist: str,
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
+    if len(sys.argv) < 2 and not cl.category():
         print(__doc__)
         sys.exit(1)
     if len(sys.argv) < 5:
-        overview(sys.argv[1])
+        overview(cl.panel_arg(sys.argv[1:], 0))
     else:
-        trace(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4],
+        trace(cl.panel_arg(sys.argv[1:], 0), sys.argv[2], sys.argv[3], sys.argv[4],
               int(sys.argv[5]) if len(sys.argv) > 5 else None,
               sys.argv[6] if len(sys.argv) > 6 else None)

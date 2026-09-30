@@ -5,6 +5,8 @@
 「インボックスに載った最初の月」と「上位N件に入った最初の月」を出す。
 遅れ月がマイナス = 販社報告より先に捕捉できた。
 """
+import config_loader as cl
+cl.activate_from_argv()          # --cat X でカテゴリ設定に切り替え
 import pandas as pd, unified_inbox as ui, settings as st
 
 LOOKBACK, TOPN = st.LOOKBACK_M, st.TOP_N
@@ -24,15 +26,16 @@ def check(panel_path, labels_path, cfg=None, cols=None,
           lookback=LOOKBACK, top_n=TOPN, ahead=0):
     cfg = dict(cfg or st.build_cfg()); cols = cols or st.COLS
     raw = pd.read_csv(panel_path, encoding="utf-8-sig")
-    raw["年月"] = raw["年月"].astype(str).str.replace(r"\D", "", regex=True).astype(int)
-    p_all, p_dist = raw[raw.販社 == st.ALL_TOKEN], raw[raw.販社 != st.ALL_TOKEN]
+    raw[st.COLS["ym"]] = raw[st.COLS["ym"]].astype(str).str.replace(r"\D", "", regex=True).astype(int)
+    dcol = raw[st.COLS["dist"]].astype(str)
+    p_all, p_dist = raw[dcol == st.ALL_TOKEN], raw[dcol != st.ALL_TOKEN]
 
     lab = pd.read_csv(labels_path, encoding="utf-8-sig")
     lab["発生年月"] = (lab["発生年月"].astype(str)
                    .str.replace(r"\D", "", regex=True).str[:6].astype(int))
 
     # 評価に必要な月をまとめて1回ずつ実行（ラベルごとに回すと重複するため）
-    have = set(raw["年月"].unique())
+    have = set(raw[st.COLS["ym"]].unique())
     months = set()
     for y in lab["発生年月"]:
         for k in range(-lookback, ahead + 1):
@@ -69,4 +72,9 @@ def check(panel_path, labels_path, cfg=None, cols=None,
 
 if __name__ == "__main__":
     import sys
-    check(sys.argv[1], sys.argv[2])
+    a = sys.argv[1:]
+    if len(a) == 1 and cl.category():      # --cat レンズ labels.csv
+        a = ["-"] + a
+    if len(a) < 2:
+        print(__doc__); sys.exit(1)
+    check(cl.panel_arg(a, 0), a[1])

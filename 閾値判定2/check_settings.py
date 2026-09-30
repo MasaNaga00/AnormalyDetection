@@ -24,6 +24,8 @@ import sys
 import glob
 import datetime as dt
 
+import config_loader as cl
+cl.activate_from_argv()          # --cat X でカテゴリ設定に切り替え
 import settings as st
 
 KEYS = ["USE_HORIZON", "C_REVISIT_MONTHS", "HORIZON_MARGIN_MONTHS",
@@ -36,12 +38,22 @@ def main():
     print("=" * 70)
     print("実際に読み込まれている settings.py")
     print("=" * 70)
-    path = os.path.abspath(st.__file__)
+    path = os.path.abspath(getattr(st, "_BASE_FILE", st.__file__))
     print(f"  パス     : {path}")
     if os.path.exists(path):
         ts = dt.datetime.fromtimestamp(os.path.getmtime(path))
         print(f"  最終更新 : {ts:%Y-%m-%d %H:%M:%S}")
     print(f"  作業ディレクトリ : {os.getcwd()}")
+    if cl.category():
+        cp = os.path.abspath(st.__file__)
+        ts = dt.datetime.fromtimestamp(os.path.getmtime(cp))
+        print(f"  カテゴリ : {cl.category()}")
+        print(f"  カテゴリ設定 : {cp}  (最終更新 {ts:%Y-%m-%d %H:%M:%S})")
+        print(f"  パネル   : {getattr(st, 'PANEL_PATH', None)}")
+        print(f"  台帳     : {getattr(st, 'LEDGER_PATH', None)}")
+        print(f"  出力先   : {cl.base_dir()}/YYYYMM/")
+    else:
+        print("  カテゴリ : （なし。--cat レンズ のように指定）")
 
     print("\n=== 主要な値 ===")
     for k in KEYS:
