@@ -43,11 +43,8 @@ ROOT = os.path.dirname(HERE)                       # 閾値判定2
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-import warnings
 import numpy as np
 import pandas as pd
-
-warnings.filterwarnings("ignore", category=FutureWarning)   # 本体側の pandas 警告を抑止
 
 import config_loader as cl
 cl.activate_from_argv()          # --cat X でカテゴリ設定に切り替え
@@ -97,7 +94,8 @@ def _resolve_biz(raw, dev, part, biz=None) -> str:
 def _threshold_series(p_all_unit: pd.DataFrame, cfg: dict, biz, dev, part) -> pd.DataFrame:
     """閾値: 月ごとの累積率と当月閾値。build_unified_inbox と同じ前処理。"""
     sl_cfg = dict(sl.CONFIG)
-    sl_cfg["cols"] = {**sl.CONFIG["cols"], **st.COLS}
+    sl_cfg["cols"] = {**sl.CONFIG["cols"],
+                      **{k: v for k, v in st.COLS.items() if k != "part_name"}}
     sl_cfg.update({k: cfg[k] for k in
                    ("base_threshold_pct", "threshold_overrides", "min_denominator")})
     ren = {v: k for k, v in sl_cfg["cols"].items() if v is not None}
@@ -283,11 +281,15 @@ def trace(dev, part, biz=None, raw: pd.DataFrame | None = None,
     # --- 信号C ---
     cres = _signal_c_series(u_dist, cfg)
     tl = tl.merge(_c_month_summary(cres), on="ym", how="left")
-    tl["信号C判定"] = tl["信号C判定"].fillna(False).astype(bool)
+    tl["信号C判定"] = tl["信号C判定"].eq(True)        # 欠損（販社データなし）は False
     tl["信号C理由"] = tl["信号C理由"].fillna("販社別データなし")
 
     det = [("閾値", "閾値判定"), ("信号B", "信号B判定"), ("信号C", "信号C判定")]
     tl["鳴った検出器"] = ["/".join(n for n, col in det if bool(r[col])) for _, r in tl.iterrows()]
+    import unified_inbox as ui
+    names = ui.part_name_map([unit], c)
+    pname = names["部品名"].iloc[0] if len(names) else ""
+    tl.insert(0, "部品名", pname)
     tl.insert(0, "部番", part); tl.insert(0, "開発コード", dev); tl.insert(0, "事業コード", biz)
     tl = tl.rename(columns={"ym": "年月"})
     if cl.category():
@@ -322,7 +324,7 @@ def trace(dev, part, biz=None, raw: pd.DataFrame | None = None,
                 "/".join(first[first["初検出"] == first["初検出"].min()]["検出器"])) if len(first) else (None, "")
 
     if not quiet:
-        print(f"\n=== {dev} / {part}（{biz}）  期間 {lo}〜{hi}"
+        print(f"\n=== {dev} / {part}" + (f" {pname}" if pname else "") + f"（{biz}）  期間 {lo}〜{hi}"
               + (f"  カテゴリ={cl.category()}" if cl.category() else "") + " ===")
         print(summ.to_string(index=False))
         print(f"→ 最も早い検出: {earliest[0]}（{earliest[1]}）" if earliest[0]
@@ -370,6 +372,9 @@ def trace_list(list_path: str, raw: pd.DataFrame | None = None,
         row = dict(事業コード=res["biz"], 開発コード=dev, 部番=part,
                    閾値=s.get("閾値"), 信号B=s.get("信号B"), 信号C=s.get("信号C"),
                    最早=res["earliest"][0], 最早の検出器=res["earliest"][1])
+        row = {**{k: row[k] for k in ("事業コード", "開発コード", "部番")},
+               "部品名": res["timeline"]["部品名"].iloc[0] if len(res["timeline"]) else "",
+               **{k: v for k, v in row.items() if k not in ("事業コード", "開発コード", "部番")}}
         if col_ym and rr.get(col_ym):
             rep = int("".join(ch for ch in str(rr[col_ym]) if ch.isdigit())[:6])
             row["発生年月"] = rep

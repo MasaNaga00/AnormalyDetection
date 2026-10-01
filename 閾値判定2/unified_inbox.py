@@ -45,7 +45,7 @@ import reporting_horizon as rh
 DETECTORS = ("閾値", "信号B", "信号C", "CUSUM")
 
 LEDGER_COLS = [
-    "記録日", "事業コード", "開発コード", "部番", "検出器", "対象販社",
+    "記録日", "事業コード", "開発コード", "部番", "部品名", "検出器", "対象販社",
     "判定年月", "処置区分", "再評価年月",
     "上書き閾値", "上書きR", "上書きh",
     "新ベースライン値", "ベースライン窓起点", "ベースライン窓長",
@@ -383,6 +383,49 @@ def merge_candidates(parts: list[pd.DataFrame], lv: LedgerView, cfg: dict) -> pd
     return g.sort_values("統合注目度", ascending=False).reset_index(drop=True)
 
 
+# ============================================================================
+# 部品名（表示用）
+# ============================================================================
+def part_name_map(panels: list, cols: dict) -> pd.DataFrame:
+    """機種×部番 → 部品名。パネルに部品名の列が無ければ空の表。
+
+    機種によって同じ部番でも名前が違うことがあるので、キーは (事業, 機種, 部番)。
+    月によって表記が変わる場合は最新月の値を使う。
+    """
+    out_cols = ["事業コード", "開発コード", "部番", "部品名"]
+    col = cols.get("part_name")
+    ps = [p for p in panels if p is not None and col and col in p.columns]
+    if not ps:
+        return pd.DataFrame(columns=out_cols)
+    k = [cols["biz"], cols["dev"], cols["part"]]
+    d = pd.concat([p[k + [cols["ym"], col]] for p in ps], ignore_index=True)
+    d = d[d[col].notna() & (d[col].astype(str).str.strip() != "")]
+    if d.empty:
+        return pd.DataFrame(columns=out_cols)
+    d["_ym"] = d[cols["ym"]].map(sd._to_ym)
+    d = d.sort_values("_ym").groupby(k, as_index=False).last()
+    d = d[k + [col]]
+    d.columns = out_cols
+    for c in out_cols[:3]:
+        d[c] = d[c].astype(str)
+    return d
+
+
+def add_part_name(df: pd.DataFrame, names: pd.DataFrame,
+                  keys=("事業コード", "開発コード", "部番")) -> pd.DataFrame:
+    """df の部番の右に部品名列を入れる（見つからなければ空欄）。keys は df 側の列名。"""
+    if df is None or df.empty or names is None:
+        return df
+    k = list(keys)
+    m = names.rename(columns=dict(zip(["事業コード", "開発コード", "部番"], k)))
+    left = df.drop(columns=["部品名"], errors="ignore")
+    tmp = left[k].astype(str).merge(m, on=k, how="left")
+    out = left.copy()
+    pos = list(out.columns).index(k[2]) + 1
+    out.insert(pos, "部品名", tmp["部品名"].fillna("").to_numpy())
+    return out
+
+
 def build_unified_inbox(panel_all: pd.DataFrame, panel_dist: pd.DataFrame,
                         ledger: pd.DataFrame, cfg: dict,
                         cols: dict, asof_ym: int | None = None) -> dict:
@@ -391,11 +434,15 @@ def build_unified_inbox(panel_all: pd.DataFrame, panel_dist: pd.DataFrame,
     panel_all  : ALL行のみのパネル（生の列名）。閾値・信号Bで使う
     panel_dist : 販社別行のパネル（生の列名）。信号Cで使う
     Returns: dict(inbox, top, b_raw, c_raw, b_parts, rates, asof,
-                  horizon, horizon_report, completeness)
+                  horizon, horizon_report, completeness, part_names)
+    cols["part_name"] があれば inbox / c_raw / b_parts の部番の右に部品名を付ける（表示用）。
 
     cfg["use_horizon"] が真のマスタースイッチ。False なら horizon・再評価窓・
     信号Bの打ち切りはすべて無効（遅延対応前と同一挙動）。
     """
+    names = part_name_map([panel_all, panel_dist], cols)
+    cols = {k: v for k, v in cols.items() if k != "part_name"}   # 検出器には渡さない
+
     # --- 閾値用の率テーブル ---
     sl_cfg = dict(sl.CONFIG)
     sl_cfg["cols"] = {**sl.CONFIG["cols"], **{k: v for k, v in cols.items()}}
@@ -457,10 +504,12 @@ def build_unified_inbox(panel_all: pd.DataFrame, panel_dist: pd.DataFrame,
     cand = [candidates_threshold(rates, lv, cfg),
             candidates_signal_b(res_b, p_b, lv, cfg),
             candidates_signal_c(res_c, lv, cfg)]
-    inbox = merge_candidates(cand, lv, cfg)
+    inbox = add_part_name(merge_candidates(cand, lv, cfg), names)
+    res_c = add_part_name(res_c, names, keys=("biz", "dev", "part"))
+    b_parts = add_part_name(expand_signal_b_to_parts(res_b, p_b, cfg["b_elapsed_cap"]),
+                            names, keys=("biz", "dev", "part"))
     return dict(inbox=inbox, top=inbox.head(cfg["top_n"]),
-                b_raw=res_b, c_raw=res_c,
-                b_parts=expand_signal_b_to_parts(res_b, p_b, cfg["b_elapsed_cap"]),
+                b_raw=res_b, c_raw=res_c, b_parts=b_parts, part_names=names,
                 rates=rates, asof=T,
                 horizon=hz, horizon_global=hz_global,
                 horizon_report=hz_report, completeness=completeness)

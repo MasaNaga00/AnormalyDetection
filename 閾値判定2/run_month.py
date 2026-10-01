@@ -54,7 +54,7 @@ CFG = st.build_cfg()
 OUT_ROOT = st.OUT_ROOT
 
 # 台帳に貼り付ける列（インボックスの列 → 台帳の列 と同じ並び）
-REVIEW_COLS = ["事業コード", "開発コード", "部番", "検出器", "対象販社",
+REVIEW_COLS = ["事業コード", "開発コード", "部番", "部品名", "検出器", "対象販社",
                "判定年月", "対象月内訳", "遅延月", "run年月", "統合注目度", "状態", "指標",
                "観測率", "当月閾値", "提案Y下限",
                "処置区分", "再評価年月", "上書き閾値", "原因メモ", "確認者"]
@@ -63,7 +63,8 @@ REVIEW_COLS = ["事業コード", "開発コード", "部番", "検出器", "対
 def _fileinfo(path) -> str:
     try:
         ts = dt.datetime.fromtimestamp(os.path.getmtime(path))
-        h = hashlib.sha256(open(path, "rb").read()).hexdigest()[:8]
+        with open(path, "rb") as f:
+            h = hashlib.sha256(f.read()).hexdigest()[:8]
         return f"{os.path.abspath(path)}  (更新 {ts:%Y-%m-%d %H:%M:%S}, sha256 {h})"
     except OSError:
         return f"{path}  (読めない)"
@@ -106,6 +107,20 @@ def main(panel_path: str, ledger_path: str, out_root: str = OUT_ROOT,
     print(f"パネル: {len(raw)}行  ALL={len(p_all)}  販社別={len(p_dist)}")
 
     ledger = ui.load_ledger(ledger_path)
+    # 台帳の列並びの確認（レビュー用CSVの A〜G 列を台帳の B〜H 列に貼る前提）
+    try:
+        head = list(pd.read_excel(ledger_path, sheet_name="台帳", nrows=0).columns)
+    except Exception:
+        head = []
+    if head and "部品名" not in head:
+        print("[注意] 台帳に「部品名」列がありません。レビュー用CSVは部番の右に部品名が入るので、"
+              "そのまま貼ると列が1つずれます。\n"
+              "       台帳の「部番」の右に列を挿入し、見出しを「部品名」にしてください"
+              "（はじめに_使い方ガイド.md 3.3）。")
+    pn = c.get("part_name")
+    if pn and pn not in raw.columns:
+        print(f"[注意] パネルに部品名の列「{pn}」がありません。部品名は空欄で出力します"
+              "（列名が違う場合は COLS['part_name'] を直す）。")
     print(f"台帳: {len(ledger)}行")
 
     r = ui.build_unified_inbox(p_all, p_dist, ledger, CFG, COLS)
@@ -167,7 +182,8 @@ def main(panel_path: str, ledger_path: str, out_root: str = OUT_ROOT,
         return
     print(inbox["検出器"].value_counts().to_string())
     print()
-    show = ["開発コード", "部番", "検出器", "対象販社", "遅延月", "統合注目度", "指標"]
+    show = [x for x in ["開発コード", "部番", "部品名", "検出器", "対象販社", "遅延月",
+                        "統合注目度", "指標"] if x in inbox.columns]
     print(inbox.head(CFG["top_n"])[show].to_string(index=False))
     print(f"\n出力先: {outdir}/")
     print(f"→ {review_path} を開き、処置区分を記入して台帳に追記してください。")

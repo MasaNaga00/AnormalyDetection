@@ -161,7 +161,7 @@ def run_signal_b(panel: pd.DataFrame, elapsed_cap: int = 36, min_peers: int = 2,
                & (u["C_peer"] >= min_peer_count) & (u["O_E"] >= min_oe))
         if bad.any():
             flag = u0.merge(u.loc[bad, ["biz", "sf", "dev"]].assign(_x=True),
-                            on=["biz", "sf", "dev"], how="left")["_x"].fillna(False)
+                            on=["biz", "sf", "dev"], how="left")["_x"].notna()
             # 除外してピアが min_peers を割る群は1パス目の結果を使う
             u2 = _peer_compare(u0, key, min_peers, exclude=flag.to_numpy())
             if not u2.empty:

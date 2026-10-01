@@ -161,6 +161,20 @@ def _prepare_panel(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     return df
 
 
+def _fill_obj(s: pd.Series) -> pd.Series:
+    """文字列などの object 列を前後埋めする（pandas 2.2+ の FutureWarning 対策）。
+
+    object 列の ffill/bfill は、結果を数値型などへ暗黙に変換（downcast）する挙動が
+    廃止予定で警告が出る。暗黙変換しない新しい挙動で埋めてから infer_objects で
+    型を決めるので、結果は従来と同じ。古い pandas はオプションが無いので従来どおり。
+    """
+    try:
+        with pd.option_context("future.no_silent_downcasting", True):
+            return s.ffill().bfill().infer_objects(copy=False)
+    except (KeyError, AttributeError):          # pandas < 2.2（OptionError）
+        return s.ffill().bfill()
+
+
 def _fill_zero_months(df: pd.DataFrame) -> pd.DataFrame:
     out = []
     keys = ["biz", "dev", "part", "dist"]
@@ -177,7 +191,7 @@ def _fill_zero_months(df: pd.DataFrame) -> pd.DataFrame:
         g2["elapsed"] = g2["elapsed"].ffill()
         for col in ("sf", "rank"):  # 静的属性は前後埋め
             if col in g2.columns:
-                g2[col] = g2[col].ffill().bfill()
+                g2[col] = _fill_obj(g2[col])
         for i, k in enumerate(keys):
             g2[k] = key[i] if isinstance(key, tuple) else key
         out.append(g2.reset_index().rename(columns={"index": "ym"}))
